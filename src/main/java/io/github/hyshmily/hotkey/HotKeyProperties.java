@@ -1,10 +1,12 @@
 package io.github.hyshmily.hotkey;
 
+import jakarta.validation.constraints.Min;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 @ConfigurationProperties(prefix = "hotkey")
 public class HotKeyProperties {
 
+  @Min(1)
   private int topK = 100;
   private int width = 100_000;
   private int depth = 5;

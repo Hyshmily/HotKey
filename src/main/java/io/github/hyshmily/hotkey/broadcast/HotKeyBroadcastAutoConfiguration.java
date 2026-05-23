@@ -44,11 +44,9 @@ public class HotKeyBroadcastAutoConfiguration {
   @Bean
   @ConditionalOnMissingBean
   public BroadcastPublisher broadcastPublisher(
-    RabbitTemplate rabbitTemplate,
-    Cache<String, Object> hotLocalCache,
-    RedisTemplate<String, Object> redisTemplate
+    RabbitTemplate rabbitTemplate
   ) {
-    return new BroadcastPublisher(rabbitTemplate, properties, hotLocalCache, redisTemplate);
+    return new BroadcastPublisher(rabbitTemplate, properties);
   }
 
   @Bean

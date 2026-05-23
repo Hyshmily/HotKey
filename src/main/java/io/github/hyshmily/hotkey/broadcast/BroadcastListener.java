@@ -26,24 +26,24 @@ public class BroadcastListener {
   }
 
   @RabbitListener(queues = "#{@broadcastProperties.queueName}", ackMode = "MANUAL")
-  public void handleHotKeyMessage(String body, Channel channel, Message msg) throws IOException {
+  public void handleHotKeyMessage(Channel channel, Message msg) throws IOException {
     long tag = msg.getMessageProperties().getDeliveryTag();
     try {
-      processBroadcast(body);
+      processBroadcast(msg);
       channel.basicAck(tag, false);
     } catch (Exception e) {
-      log.error("HotKey broadcast processing failed, message discarded: body={}, error={}", body, e.toString());
+      log.error("HotKey broadcast processing failed: body={}", new String(msg.getBody()), e);
       channel.basicNack(tag, false, false);
     }
   }
 
-  private void processBroadcast(String body) {
-    String redisHashKey = body.substring(0, body.indexOf(":"));
-    String fieldKey = body.substring(body.indexOf(":") + 1);
+  private void processBroadcast(Message msg) {
+    String redisHashKey = msg.getMessageProperties().getHeader("hk");
+    String fieldKey = msg.getMessageProperties().getHeader("fk");
     String cacheKey = redisHashKey + ":" + fieldKey;
 
     Optional.ofNullable(caffeineCache.getIfPresent(cacheKey)).ifPresentOrElse(
-      existing -> log.debug("HotKey broadcast message skipped: local caffeine cache already exists: {}", cacheKey),
+      _ -> log.debug("HotKey broadcast message skipped: local caffeine cache already exists: {}", cacheKey),
       () -> {
         Object value = redisTemplate.opsForHash().get(redisHashKey, fieldKey);
         if (value != null) {

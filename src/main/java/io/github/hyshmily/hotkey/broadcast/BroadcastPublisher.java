@@ -4,14 +4,14 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.hyshmily.hotkey.HotKeyBroadcaster;
 import jakarta.annotation.PostConstruct;
+import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.amqp.core.Message;
+import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.transaction.support.TransactionSynchronization;
-import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 public class BroadcastPublisher implements HotKeyBroadcaster {
 
@@ -19,21 +19,15 @@ public class BroadcastPublisher implements HotKeyBroadcaster {
 
   private final RabbitTemplate rabbitTemplate;
   private final BroadcastProperties properties;
-  private final Cache<String, Object> caffeineCache;
-  private final RedisTemplate<String, Object> redisTemplate;
 
   private Cache<String, Boolean> recentBroadcasts;
 
   public BroadcastPublisher(
     RabbitTemplate rabbitTemplate,
-    BroadcastProperties properties,
-    Cache<String, Object> caffeineCache,
-    RedisTemplate<String, Object> redisTemplate
+    BroadcastProperties properties
   ) {
     this.rabbitTemplate = rabbitTemplate;
     this.properties = properties;
-    this.caffeineCache = caffeineCache;
-    this.redisTemplate = redisTemplate;
   }
 
   @PostConstruct
@@ -54,42 +48,31 @@ public class BroadcastPublisher implements HotKeyBroadcaster {
 
   @Override
   public void broadcastHotKey(String redisHashKey, String fieldKey) {
-    validateCacheKey(redisHashKey, fieldKey).ifPresent(this::publishHotKey);
-  }
-
-  public void putAndBroadcast(String redisHashKey, String fieldKey, Object value) {
     validateCacheKey(redisHashKey, fieldKey).ifPresent(cacheKey ->
-      runAfterCommit(() -> {
-        redisTemplate.opsForHash().put(redisHashKey, fieldKey, value);
-        caffeineCache.put(cacheKey, value);
-        publishHotKey(cacheKey);
-      })
+      publishHotKey(redisHashKey, fieldKey, cacheKey)
     );
   }
 
-  private void publishHotKey(String cacheKey) {
+  private void publishHotKey(String redisHashKey, String fieldKey, String cacheKey) {
     Optional.ofNullable(recentBroadcasts.getIfPresent(cacheKey)).ifPresentOrElse(
-      existing -> log.debug("Skip duplicate broadcast: {}", cacheKey),
-      () -> {
-        recentBroadcasts.put(cacheKey, Boolean.TRUE);
-        rabbitTemplate.convertAndSend(properties.getExchangeName(), "", cacheKey);
-        log.debug("HotKey broadcast: {}", cacheKey);
-      }
-    );
-  }
-
-  private void runAfterCommit(Runnable task) {
-    if (TransactionSynchronizationManager.isSynchronizationActive()) {
-      TransactionSynchronizationManager.registerSynchronization(
-        new TransactionSynchronization() {
-          @Override
-          public void afterCommit() {
-            task.run();
+      _ -> log.debug("Skip duplicate broadcast: {}", cacheKey),
+      () ->
+        Optional.ofNullable(recentBroadcasts.asMap().putIfAbsent(cacheKey, Boolean.TRUE)).ifPresentOrElse(
+          _ -> log.debug("Concurrent broadcast already handled by another thread, skip: {}", cacheKey),
+          () -> {
+            try {
+              MessageProperties props = new MessageProperties();
+              props.setHeader("hk", redisHashKey);
+              props.setHeader("fk", fieldKey);
+              Message msg = new Message(cacheKey.getBytes(StandardCharsets.UTF_8), props);
+              rabbitTemplate.send(properties.getExchangeName(), "", msg);
+              log.debug("HotKey broadcast: {}", cacheKey);
+            } catch (Exception e) {
+              recentBroadcasts.invalidate(cacheKey);
+              log.error("Failed to broadcast hot key: {}", cacheKey, e);
+            }
           }
-        }
-      );
-      return;
-    }
-    task.run();
+        )
+    );
   }
 }

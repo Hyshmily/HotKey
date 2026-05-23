@@ -60,7 +60,7 @@ public Object getData(String hashKey, String fieldKey) {
 
 public void updateData(String hashKey, String fieldKey, Object value) {
     // update database...
-    hotKeyCache.updateCaffeineIfPresent(hashKey, fieldKey, value);
+    hotKeyCache.putAndBroadcast(hashKey, fieldKey, value);
 }
 ```
 
@@ -105,6 +105,12 @@ String value = (String) hotKeyCache.get(hashKey, fieldKey);
    ↓       ↓                               ↓
 刷新缓存  返回null ───→ DB回退    Caffeine.put + 广播
 ```
+
+写路径（用户主动调用）：
+`hotKeyCache.putAndBroadcast(redisHashKey, fieldKey, value)`
+├─ Redis Hash 写入
+├─ Caffeine 本地缓存更新
+└─ RabbitMQ fanout 广播（如启用）
 
 ## 模块
 

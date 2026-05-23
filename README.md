@@ -60,7 +60,7 @@ public Object getData(String hashKey, String fieldKey) {
 
 public void updateData(String hashKey, String fieldKey, Object value) {
     // update database...
-    hotKeyCache.updateCaffeineIfPresent(hashKey, fieldKey, value);
+    hotKeyCache.putAndBroadcast(hashKey, fieldKey, value);
 }
 ```
 
@@ -105,6 +105,12 @@ The request flow: Caffeine L1 → Redis L2 → HeavyKeeper detection:
 refresh   return null ───→ DB fallback    Caffeine.put
 cache                                       + broadcast
 ```
+
+Write path (user-initiated):
+`hotKeyCache.putAndBroadcast(redisHashKey, fieldKey, value)`
+├─ Redis Hash write
+├─ Caffeine local cache update
+└─ RabbitMQ fanout broadcast (if enabled)
 
 ## Modules
 

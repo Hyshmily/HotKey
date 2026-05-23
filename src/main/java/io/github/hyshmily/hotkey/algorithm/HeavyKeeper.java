@@ -51,10 +51,11 @@ public class HeavyKeeper implements TopK {
     long itemFingerprint = Hashing.murmur3_32_fixed().hashString(key, StandardCharsets.UTF_8).padToLong() & 0xFFFFFFFFL;
     int maxCount = 0;
 
+    Bucket[] touched = new Bucket[depth];
     for (int i = 0; i < depth; i++) {
-      int bucketIndex =
-        Math.abs(Hashing.murmur3_32_fixed().hashString(key + "_" + i, StandardCharsets.UTF_8).asInt()) % width;
+      int bucketIndex = Math.abs((int) (itemFingerprint ^ (i * 0x9e3779b97f4a7c15L))) % width;
       Bucket bucket = buckets[i][bucketIndex];
+      touched[i] = bucket;
 
       synchronized (bucket) {
         if (bucket.count == 0) {
@@ -93,6 +94,14 @@ public class HeavyKeeper implements TopK {
       minHeap.removeIf(n -> n.key.equals(key));
       boolean isHot = false;
       String expelled = null;
+
+      int actualMax = 0;
+      for (int i = 0; i < depth; i++) {
+        synchronized (touched[i]) {
+          actualMax = Math.max(actualMax, touched[i].count);
+        }
+      }
+      maxCount = actualMax;
 
       if (minHeap.size() < k || maxCount >= Objects.requireNonNull(minHeap.peek()).count) {
         Node newNode = new Node(key, maxCount);

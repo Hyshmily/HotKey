@@ -9,6 +9,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 public class HotKeyCache {
 
@@ -62,27 +64,34 @@ public class HotKeyCache {
             return redisValue;
           })
           .orElseGet(() -> {
-            log.warn("Caffeine L1 miss,Redis L2 miss: key={}", cacheKey);
+            log.debug("Caffeine L1 miss,Redis L2 miss: key={}", cacheKey);
             return null;
           });
       });
   }
 
-  public void updateCaffeineIfPresent(String redisHashKey, String fieldKey, Object value) {
+  public void putAndBroadcast(String redisHashKey, String fieldKey, Object value) {
     String cacheKey = cacheKey(redisHashKey, fieldKey);
+    runAfterCommit(() -> {
+      redisTemplate.opsForHash().put(redisHashKey, fieldKey, value);
+      caffeineCache.put(cacheKey, value);
+      broadcaster.ifPresent(p -> p.broadcastHotKey(redisHashKey, fieldKey));
+    });
+  }
 
-    try {
-      Optional.ofNullable(caffeineCache.getIfPresent(cacheKey)).ifPresentOrElse(
-        existing -> {
-          caffeineCache.put(cacheKey, value);
-          log.debug("refresh local caffeine cache expiration time: {}", cacheKey);
-        },
-        () -> log.debug("Key not found in local caffeine cache: {}", cacheKey)
+  private void runAfterCommit(Runnable task) {
+    if (TransactionSynchronizationManager.isSynchronizationActive()) {
+      TransactionSynchronizationManager.registerSynchronization(
+        new TransactionSynchronization() {
+          @Override
+          public void afterCommit() {
+            task.run();
+          }
+        }
       );
-    } catch (Exception e) {
-      caffeineCache.invalidate(cacheKey);
-      log.error("update caffeine cache failed , invalidated: {}", cacheKey, e);
+      return;
     }
+    task.run();
   }
 
   @Scheduled(fixedDelayString = "${hotkey.decay-period:20}", timeUnit = TimeUnit.SECONDS)
