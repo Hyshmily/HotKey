@@ -23,7 +23,7 @@ HotKey — [HeavyKeeper](https://github.com/go-kratos/aegis) top-k hot key detec
 <dependency>
     <groupId>io.github.hyshmily</groupId>
     <artifactId>hotkey-spring-boot-starter</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
 </dependency>
 ```
 
