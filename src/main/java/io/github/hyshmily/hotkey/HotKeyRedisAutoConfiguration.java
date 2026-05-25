@@ -3,6 +3,8 @@ package io.github.hyshmily.hotkey;
 import com.github.benmanes.caffeine.cache.Cache;
 import io.github.hyshmily.hotkey.algorithm.TopK;
 import io.github.hyshmily.hotkey.broadcast.BroadcastPublisher;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.Optional;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -21,8 +23,10 @@ public class HotKeyRedisAutoConfiguration {
   public HotKeyCache hotKeyCache(
     TopK hotKeyDetector,
     Cache<String, Object> hotLocalCache,
-    Optional<BroadcastPublisher> broadcastPublisher
+    Cache<String, CompletableFuture<Object>> inflightLoads,
+    Optional<BroadcastPublisher> broadcastPublisher,
+    Executor hotKeyExecutor
   ) {
-    return new HotKeyCache(hotKeyDetector, hotLocalCache, broadcastPublisher);
+    return new HotKeyCache(hotKeyDetector, hotLocalCache, inflightLoads, broadcastPublisher, hotKeyExecutor);
   }
 }

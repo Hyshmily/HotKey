@@ -2,8 +2,13 @@ package io.github.hyshmily.hotkey.broadcast;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import io.github.hyshmily.hotkey.HotKeyCache;
+import static io.github.hyshmily.hotkey.HotKeyCache.invalidCacheKey;
+import static io.github.hyshmily.hotkey.HotKeyCache.invalidTypeKey;
+import static io.github.hyshmily.hotkey.broadcast.BroadcastProperties.TYPE_HOT;
+import static io.github.hyshmily.hotkey.broadcast.BroadcastProperties.TYPE_INVALIDATE;
+
 import jakarta.annotation.PostConstruct;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -16,8 +21,6 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 public class BroadcastPublisher {
 
   private static final Logger log = LoggerFactory.getLogger(BroadcastPublisher.class);
-
-  static final String TYPE_INVALIDATE = "INVALIDATE";
 
   private final RabbitTemplate rabbitTemplate;
   private final BroadcastProperties properties;
@@ -38,7 +41,7 @@ public class BroadcastPublisher {
   }
 
   public void broadcastHotKey(String cacheKey) {
-    sendDeduped(cacheKey, null);
+    sendDeduped(cacheKey, TYPE_HOT);
   }
 
   public void invalidateHotKey(String cacheKey) {
@@ -46,15 +49,16 @@ public class BroadcastPublisher {
   }
 
   private void sendDeduped(String cacheKey, String type) {
-    if (HotKeyCache.invalidCacheKey(cacheKey)) {
-      log.warn("Invalid cacheKey: {}", cacheKey);
+    if (invalidCacheKey(cacheKey) || invalidTypeKey(type)) {
+      log.warn("Invalid cacheKey or type, skip broadcast: cacheKey={}, type={}", cacheKey, type);
       return;
     }
+    String compositeCacheKey = type + ":" + cacheKey;
 
-    Optional.ofNullable(recentBroadcasts.getIfPresent(cacheKey)).ifPresentOrElse(
+    Optional.ofNullable(recentBroadcasts.getIfPresent(compositeCacheKey)).ifPresentOrElse(
       _ -> log.debug("Skip duplicate broadcast: {}", cacheKey),
       () ->
-        Optional.ofNullable(recentBroadcasts.asMap().putIfAbsent(cacheKey, Boolean.TRUE)).ifPresentOrElse(
+        Optional.ofNullable(recentBroadcasts.asMap().putIfAbsent(compositeCacheKey, Boolean.TRUE)).ifPresentOrElse(
           _ -> log.debug("Concurrent broadcast already handled by another thread, skip: {}", cacheKey),
           () -> {
             try {
@@ -62,7 +66,7 @@ public class BroadcastPublisher {
               rabbitTemplate.send(properties.getExchangeName(), "", msg);
               log.debug("HotKey broadcast: {} type={}", cacheKey, type);
             } catch (Exception e) {
-              recentBroadcasts.invalidate(cacheKey);
+              recentBroadcasts.invalidate(compositeCacheKey);
               log.error("Failed to broadcast hot key: {}", cacheKey, e);
             }
           }
@@ -71,11 +75,8 @@ public class BroadcastPublisher {
   }
 
   private static Message buildMessage(String cacheKey, String type) {
-    if (type == null) {
-      return new Message(cacheKey.getBytes(StandardCharsets.UTF_8));
-    }
     MessageProperties props = new MessageProperties();
     props.setHeader("type", type);
-    return new Message(cacheKey.getBytes(StandardCharsets.UTF_8), props);
+    return new Message(cacheKey.getBytes((Charset) StandardCharsets.UTF_8), props);
   }
 }

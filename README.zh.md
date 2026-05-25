@@ -2,8 +2,28 @@
 
 [**English**](README.md)
 
-HotKey — 基于 [HeavyKeeper](https://github.com/go-kratos/aegis) 算法的 Top-K 热点 Key 检测 & Caffeine/Redis 多级缓存自动预热 Spring Boot Starter（低精度版本）
+HotKey — HeavyKeeper Top-K 热点检测 + 多级缓存自动预热 + 分布式广播 Spring Boot Starter
 
+HotKey 不是一个通用的本地缓存——它是一个带有可选分布式广播的轻量热点 key 自动检测与多级缓存预热框架。
+
+大多数本地缓存在 Caffeine 里存每一个访问过的 key。数据量小时没问题，但在海量 key 场景下：
+
+- **内存浪费** — 绝大多数 key 只读一次就再也不会访问
+- **广播风暴** — 全量缓存要求全量失效，广播量随 key 数线性增长
+
+而HotKey却 **只缓存真正热门的 key。**
+
+通过 [HeavyKeeper](https://github.com/go-kratos/aegis)（Count-Min Sketch 变体）概率检测访问频率。只有进入 Top-K 集合的 key 才会被自动提升到本地 Caffeine L1，并通过可选的 RabbitMQ fanout 跨实例同步。非热点 key 的读取通过 `Supplier<T>` / `Function<String, Object>` 回调委托给调用方——框架对你的数据源不做任何假设。
+
+### 适用场景
+
+| 适合 | 不适合 |
+|---|---|
+| 读密集型场景（String / List / Set / ZSet） | 写密集型 / 原子操作（秒杀 Lua） |
+| 大量 key，访问呈帕累托分布 | key 数少（< 200），手动 Caffeine 即可 |
+| 读多写少，最终一致即可 | 要求写后立即可见 |
+| Spring Boot 3.x + Java 17+ | 非 Spring Boot 项目 |
+| 可选 Redis（默认 L2）+ 可选 RabbitMQ（多实例） |
 
 > [!Important]
 > 这是作者在开发过程中总结的经验模块，不能确保生产过程中的可靠性与稳定性。如需完善的热点 key 自动监测和更高精度版本，请参考 [hotkey](https://gitee.com/jd-platform-opensource/hotkey)
@@ -11,9 +31,71 @@ HotKey — 基于 [HeavyKeeper](https://github.com/go-kratos/aegis) 算法的 To
 ## 特点
 
 - **HeavyKeeper 算法** —  Count-Min Sketch + 指数冲突衰减的概率性 Top-K 检测
-- **两级缓存** — Caffeine (L1) + Redis (L2)，自动热点缓存
-- **热点广播** — 可选 RabbitMQ fanout，分布式的多实例缓存预热
+- **三级缓存** — Caffeine (L1) → Redis (L2，可选) → DB 回退，自动热点提升
+- **请求合并** — L1 未命中时同 key 并发请求共享同一 Redis 读，通过 `Caffeine<key, CompletableFuture>`
+
+  > **注意：** 确保 `hotkey.inflight-ttl-seconds` 大于最慢的 Redis 响应耗时，否则缓存条目可能在 Future 完成前过期，导致重复的 Redis 读。
+- **软失效** — 立即返回过期旧值，同时后台异步刷新；降低 p99 延迟，代价是短暂脏读
+- **Redis 集合类型** — 通过 `invalidateAfterWriteSync` 支持 List/Set/ZSet 增量写入，无需 `putAndBroadcast`
+- **热点广播** — 可选 RabbitMQ fanout，跨实例同步热点 key
+- **可配置线程池** — 专用 `TaskExecutor`，有界队列
 - **Spring Boot 自动配置** — 引入依赖即用，零样板代码
+
+
+## 架构
+
+```
+┌──────────────┐   L1 hit + add(key,1) ┌──────────────┐
+│   Request    │ ────────────────────→ │  Caffeine L1 │
+│              │ ←──────────────────── │   (local)    │
+└──────┬───────┘   Optional.of(value)  └──────┬───────┘
+       │ L1 miss                              │ isHotKey()?
+       ↓ (inflight dedup)                     ↓
+┌──────────────┐   redisReader     ┌───────────────┐
+│  L2 Storage  │ ←───────────────  │     TopK      │
+│  (pluggable) │ ───────────────→  │  (interface)  │
+└──┬───────┬───┘  add(key,1)       ├───────────────┤
+   │ hit   │ null                  │ add()→Result  │ ← 每次访问触发
+   ↓       ↓                       │ list()        │ ← 公开方法
+Optional   Optional.empty()        │ total()       │ ← 公开方法
+.of(value)   r.isEmpty() → DB      │ expelled()    │ ← 内部 drainExpelled
+                                   │ fading()      │ ← 内部 cleanHotKeys
+                                   └───────┬───────┘
+                                           │ isHotKey()
+                                           ↓
+                                     Caffeine.put(key, value)
+                                     + broadcastHotKey(cacheKey)
+```
+
+写路径（用户主动调用）：
+`hotKeyCache.putAndBroadcast(cacheKey, value, writer)`
+├─ `writer.run()` — L2 写入（调用方传入的 Runnable）
+├─ Caffeine 本地缓存更新
+└─ RabbitMQ fanout 广播（如启用）
+
+对于集合增量操作（LPUSH、SADD、ZADD）：
+`hotKeyCache.invalidateAfterWriteSync(cacheKey, mutation)`
+├─ `mutation.run()` — L2 写入（调用方传入的 Runnable）
+├─ Caffeine 本地缓存**失效**（下次读取重新回源）
+└─ RabbitMQ fanout 广播（如启用）
+
+软失效读路径（`getWithSoftExpire`）：
+
+```
+         ┌──────────────┐   L1 命中 ┌───────────────┐
+         │   Request    │ ───────→ │ softExpireAt  │
+         │              │ ←─────── │  时间检查      │
+         └──────┬───────┘  返回旧值 └───────┬───────┘
+                │ 已软过期?                 │ 过期?
+                ↓ 是                        ↓ 是
+           返回过期旧值              triggerAsyncRefresh
+           + TopK 检测                  ├─ refreshLimiter.tryAcquire()
+                │                       └─ 异步 L2 → Caffeine.put
+                │ L1 未命中（走正常路径）    + 更新 softExpireAt
+                ↓
+           loadSingleflight(cacheKey, redisReader)
+           (参见上方正常读路径)
+```
 
 ## 快速开始
 
@@ -23,7 +105,7 @@ HotKey — 基于 [HeavyKeeper](https://github.com/go-kratos/aegis) 算法的 To
 <dependency>
     <groupId>io.github.hyshmily</groupId>
     <artifactId>hotkey-spring-boot-starter</artifactId>
-    <version>1.0.2</version>
+    <version>1.0.3</version>
 </dependency>
 ```
 
@@ -50,7 +132,7 @@ hotkey:
 
 ### 3. 使用
 
-> **注意：** v1.0.2 包含**破坏性变更** — `get(hk, fk)` 和 `putAndBroadcast(hk, fk, val)` 已移除。库已与 `RedisTemplate` 解耦，调用方通过 `Supplier<T>` / `Runnable` 自行提供读写回调。
+> **注意：** 自v1.0.2起包含**破坏性变更** — `get(hk, fk)` 和 `putAndBroadcast(hk, fk, val)` 已移除。库已与 `RedisTemplate` 解耦，调用方通过 `Supplier<T>` / `Runnable` 自行提供读写回调。
 
 **A. 纯本地缓存（无二级存储）**
 
@@ -112,6 +194,63 @@ Optional<User> r = hotKeyCache.get("user:123", () -> userMapper.selectById(123))
 User user = r.orElseGet(() -> createDefaultUser());
 ```
 
+**F. Redis 集合类型（List、Set、ZSet）**
+
+`putAndBroadcast` 需要传入完整新值来更新 L1，但集合的增量操作（LPUSH、SADD、ZADD）只修改单个元素——调用方无法获知全量新值。使用 `invalidateAfterWriteSync` 在突变后失效 L1，下次 `get()` 自动回源 Redis，保证一致性。
+
+```java
+@Component
+public class CollectionHotKeyCache {
+    @Autowired private HotKeyCache hotKeyCache;
+    @Autowired private RedisTemplate<String, Object> redisTemplate;
+
+    public Boolean sIsMember(String key, Object member) {
+        return hotKeyCache.get(key + "::member::" + member,
+            () -> redisTemplate.opsForSet().isMember(key, member));
+    }
+
+    @SuppressWarnings("unchecked")
+    public Set<Object> sMembers(String key) {
+        return hotKeyCache.get(key,
+            () -> redisTemplate.opsForSet().members(key));
+    }
+
+    public void sAdd(String key, Object... members) {
+        hotKeyCache.invalidateAfterWriteSync(key,
+            () -> redisTemplate.opsForSet().add(key, members));
+    }
+
+    public List<Object> lRange(String key, long start, long end) {
+        String cacheKey = key + "::range::" + start + "::" + end;
+        return hotKeyCache.get(cacheKey,
+            () -> redisTemplate.opsForList().range(key, start, end));
+    }
+
+    public Double zScore(String key, Object member) {
+        return hotKeyCache.get(key + "::score::" + member,
+            () -> redisTemplate.opsForZSet().score(key, member));
+    }
+}
+```
+
+**G. 软失效 + Singleflight 回源**
+
+软失效立即返回已过期的旧值同时后台异步刷新。适用于允许短暂脏读以换取更低延迟的场景。
+
+```java
+Optional<String> r = hotKeyCache.getWithSoftExpire("user:123",
+    () -> redisTemplate.opsForValue().get("user:123"));
+// L1 命中但已软过期 → 返回旧值 + 触发异步刷新
+// L1 未命中 → singleflight 回源（同 get()）
+```
+
+配置示例：
+```yaml
+hotkey:
+  soft-ttl-ms: 5000               # 启用软失效，5s 软 TTL
+  refresh-concurrency: 50         # 限制异步刷新并发数
+```
+
 ### 4. 启用广播（多实例）
 
 ```yaml
@@ -120,38 +259,38 @@ hotkey:
     enabled: true
 ```
 
-广播模式通过 RabbitMQ fanout 在所有实例间同步热点 key。
+每个实例声明独立队列（`hotkey.broadcast:<pod-id>`）绑定到 fanout 交换机。热点提升时广播 key 通知对端，对端首次收到后从 Redis 回读。失效广播立即清除本地缓存。
 
+### 5. 配置属性参考
 
-## 架构
+| 属性 | 默认值 | 说明 |
+|---|---|---|
+| `hotkey.top-k` | `100` | Top-K 集合大小 |
+| `hotkey.width` | `50000` | Count-Min Sketch 宽度 |
+| `hotkey.depth` | `5` | Count-Min Sketch 深度（行数） |
+| `hotkey.decay` | `0.92` | 冲突衰减系数 |
+| `hotkey.min-count` | `10` | 热点最小计数阈值 |
+| `hotkey.local-cache-max-size` | `1000` | Caffeine L1 最大条目数 |
+| `hotkey.local-cache-ttl-minutes` | `5` | Caffeine L1 过期时间（分钟） |
+| `hotkey.inflight-max-size` | `50000` | 请求合并最大条目数 |
+| `hotkey.inflight-ttl-seconds` | `5` | 请求合并条目 TTL（需大于最慢 Redis 响应耗时） |
+| `hotkey.executor-core-pool-size` | `8` | 线程池核心线程数 |
+| `hotkey.executor-max-pool-size` | `32` | 线程池最大线程数 |
+| `hotkey.executor-queue-capacity` | `2000` | 线程池队列容量 |
+| `hotkey.broadcast.enabled` | `false` | 启用 RabbitMQ 广播 |
+| `hotkey.broadcast.exchange-name` | `hotkey.broadcast.exchange` | Fanout 交换机名 |
+| `hotkey.broadcast.queue-prefix` | `hotkey.broadcast` | 队列名前缀 |
+| `hotkey.broadcast.dedup-window-seconds` | `10` | 广播去重窗口（秒） |
+| `hotkey.broadcast.dedup-max-size` | `10000` | 广播去重最大条目数 |
+| `hotkey.decay-period` | `20` | （已废弃）衰减周期（秒），仅做向后兼容 |
+| `hotkey.broadcast.instance-id` | `${server.port:instance}-${HOSTNAME:${random.uuid}}` | 实例唯一标识 |
+| `hotkey.soft-ttl-ms` | `0` | 软失效 TTL（毫秒），0 = 禁用 |
+| `hotkey.soft-expire-max-size` | `50000` | 软失效时间表最大条目数 |
+| `hotkey.soft-expire-ttl-minutes` | `60` | 软失效时间表内部条目 TTL（分钟） |
+| `hotkey.refresh-concurrency` | `100` | 异步刷新最大并发数 |
 
-请求流程：Caffeine L1 → L2（可插拔）→ HeavyKeeper 检测：
-
-```
-┌──────────────┐   Caffeine 命中?   ┌──────────────┐
-│   Request    │ ────────────────→  │  Caffeine L1 │
-│              │ ←────────────────  │   (本地)     │
-└──────┬───────┘   Optional.of(v)   └──────┬───────┘
-       │ Caffeine 未命中?                   │ Hot key?
-       ↓                                   ↓
-┌──────────────┐                   ┌───────────────┐
-│  L2 Storage  │                   │ HeavyKeeper   │
-│  (可插拔)    │                   │   检测器      │
-└──┬───────┬───┘                   └──────┬────────┘
-   │ 找到值 │ L2/Source null               │ 被提升?
-   ↓       ↓                               ↓
-Optional   Optional.empty() ───→ DB        Caffeine.put
-.of(value)   r.isEmpty()      回退          + 广播
-```
-
-写路径（用户主动调用）：
-`hotKeyCache.putAndBroadcast(cacheKey, value, writer)`
-├─ `writer.run()` — L2 写入（调用方传入的 Runnable）
-├─ Caffeine 本地缓存更新
-└─ RabbitMQ fanout 广播（如启用）
 
 ## 模块
-
 | 模块 | 依赖 | 自动配置 |
 |------|------|---------|
 | `algorithm` | 无 | 始终生效 |

@@ -14,8 +14,8 @@ public class HotKeyProperties {
   private int topK = 100;
 
   @Min(1)
-  @Max(1_000_000)
-  private int width = 100_000;
+  @Max(200_000)
+  private int width = 50_000;
 
   @Min(1)
   @Max(10)
@@ -33,6 +33,34 @@ public class HotKeyProperties {
   @Min(1)
   private int localCacheTtlMinutes = 5;
 
+  @Min(1)
+  private int inflightMaxSize = 50_000;
+
+  @Min(1)
+  private int inflightTtlSeconds = 5;
+
+  @Min(1)
+  private int executorCorePoolSize = 8;
+
+  @Min(1)
+  private int executorMaxPoolSize = 32;
+
+  @Min(1)
+  private int executorQueueCapacity = 2000;
+
   @Deprecated
   private int decayPeriod = 20;
+
+  @Min(0)
+  private int softTtlMs = 0;
+
+  @Min(1)
+  private int softExpireMaxSize = 50_000;
+
+  @Min(1)
+  private int softExpireTtlMinutes = 60;
+
+  @Min(1)
+  private int refreshConcurrency = 100;
+
 }

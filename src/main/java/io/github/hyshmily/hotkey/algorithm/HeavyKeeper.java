@@ -1,6 +1,7 @@
 package io.github.hyshmily.hotkey.algorithm;
 
 import com.google.common.hash.Hashing;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -52,7 +53,10 @@ public class HeavyKeeper implements TopK {
   @SuppressWarnings("ResultOfMethodCallIgnored")
   public AddResult add(String key, int increment) {
     // 使用 Guava Murmur3_32 计算指纹（固定种子，保证相同 key 得到相同指纹）
-    // Compute fingerprint with Guava Murmur3_32 (fixed seed ensures same key -> same fingerprint)
+    /**
+     * Compute fingerprint with Guava Murmur3_32 (fixed seed ensures same key ->same
+     * fingerprint)
+     */
     long itemFingerprint = Hashing.murmur3_32_fixed().hashString(key, StandardCharsets.UTF_8).padToLong() & 0xFFFFFFFFL;
     int maxCount = 0;
     Bucket[] touched = new Bucket[depth];
@@ -60,7 +64,8 @@ public class HeavyKeeper implements TopK {
     for (int i = 0; i < depth; i++) {
       // 每行使用不同种子计算桶索引，增加分散性
       // Each row uses a different seed for bucket index to improve dispersion
-      int bucketIndex = Math.abs((int) (itemFingerprint ^ (i * 0x9e3779b97f4a7c15L))) % width;
+      int hash = (int) (itemFingerprint ^ (i * 0x9e3779b97f4a7c15L));
+      int bucketIndex = Math.floorMod(hash, width);
       Bucket bucket = buckets[i][bucketIndex];
       touched[i] = bucket;
 
@@ -77,8 +82,8 @@ public class HeavyKeeper implements TopK {
           // Conflict decay
           for (int j = 0; j < increment; j++) {
             double decayProb = (bucket.count < LOOKUP_TABLE_SIZE)
-              ? lookupTable[bucket.count]
-              : lookupTable[LOOKUP_TABLE_SIZE - 1];
+                ? lookupTable[bucket.count]
+                : lookupTable[LOOKUP_TABLE_SIZE - 1];
             if (ThreadLocalRandom.current().nextDouble() < decayProb) {
               bucket.count--;
               if (bucket.count == 0) {
