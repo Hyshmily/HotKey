@@ -112,12 +112,4 @@
             <artifactId>spring-tx</artifactId>
         </dependency>
     </dependencies>
-
-    <distributionManagement>
-        <repository>
-            <id>github</id>
-            <name>GitHub Hyshmily Apache Maven Packages</name>
-            <url>https://maven.pkg.github.com/Hyshmily/HotKey</url>
-        </repository>
-    </distributionManagement>
 </project>
