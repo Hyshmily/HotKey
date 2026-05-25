@@ -29,6 +29,7 @@ public class HotKeyCache {
   private final Cache<String, CompletableFuture<Object>> inflightLoads;
   private final Optional<BroadcastPublisher> broadcastPublisher;
   private final Executor hotKeyExecutor;
+  private final int inflightTimeoutSeconds;
 
   // Soft expire
   private final Cache<String, Long> softExpireAt;
@@ -36,37 +37,37 @@ public class HotKeyCache {
   private final Semaphore refreshLimiter;
 
   public HotKeyCache(
-    TopK hotKeyDetector,
-    Cache<String, Object> caffeineCache,
-    Cache<String, CompletableFuture<Object>> inflightLoads,
-    Optional<BroadcastPublisher> broadcastPublisher,
-    Executor hotKeyExecutor
-  ) {
-    this(hotKeyDetector, caffeineCache, inflightLoads, broadcastPublisher, hotKeyExecutor, 0, 0, 0, 0);
+      TopK hotKeyDetector,
+      Cache<String, Object> caffeineCache,
+      Cache<String, CompletableFuture<Object>> inflightLoads,
+      Optional<BroadcastPublisher> broadcastPublisher,
+      Executor hotKeyExecutor) {
+    this(hotKeyDetector, caffeineCache, inflightLoads, broadcastPublisher, hotKeyExecutor, 0, 0, 0, 0, 0);
   }
 
   public HotKeyCache(
-    TopK hotKeyDetector,
-    Cache<String, Object> caffeineCache,
-    Cache<String, CompletableFuture<Object>> inflightLoads,
-    Optional<BroadcastPublisher> broadcastPublisher,
-    Executor hotKeyExecutor,
-    long softTtlMs,
-    int refreshConcurrency,
-    int softExpireMaxSize,
-    int softExpireTtlMinutes
-  ) {
+      TopK hotKeyDetector,
+      Cache<String, Object> caffeineCache,
+      Cache<String, CompletableFuture<Object>> inflightLoads,
+      Optional<BroadcastPublisher> broadcastPublisher,
+      Executor hotKeyExecutor,
+      int inflightTimeoutSeconds,
+      long softTtlMs,
+      int refreshConcurrency,
+      int softExpireMaxSize,
+      int softExpireTtlMinutes) {
     this.hotKeyDetector = hotKeyDetector;
     this.caffeineCache = caffeineCache;
     this.inflightLoads = inflightLoads;
     this.broadcastPublisher = broadcastPublisher;
     this.hotKeyExecutor = hotKeyExecutor;
+    this.inflightTimeoutSeconds = inflightTimeoutSeconds;
     this.softTtlMs = softTtlMs;
     if (softTtlMs > 0) {
       this.softExpireAt = Caffeine.newBuilder()
-        .maximumSize(softExpireMaxSize > 0 ? softExpireMaxSize : 50_000)
-        .expireAfterWrite(softExpireTtlMinutes > 0 ? softExpireTtlMinutes : 60, TimeUnit.MINUTES)
-        .build();
+          .maximumSize(softExpireMaxSize > 0 ? softExpireMaxSize : 50_000)
+          .expireAfterWrite(softExpireTtlMinutes > 0 ? softExpireTtlMinutes : 60, TimeUnit.MINUTES)
+          .build();
       this.refreshLimiter = new Semaphore(refreshConcurrency > 0 ? refreshConcurrency : 100);
     } else {
       this.softExpireAt = null;
@@ -177,22 +178,30 @@ public class HotKeyCache {
 
   @SuppressWarnings("unchecked")
   private <T> Optional<T> loadSingleflight(String cacheKey, Supplier<T> redisReader) {
-    CompletableFuture<Object> loadFuture = inflightLoads.asMap().computeIfAbsent(cacheKey, key -> CompletableFuture
-        .supplyAsync(() -> (Object) redisReader.get(), hotKeyExecutor)
-        .whenComplete((value, error) -> inflightLoads.invalidate(key)));
+    CompletableFuture<Object> loadFuture = inflightLoads
+        .asMap()
+        .computeIfAbsent(cacheKey,
+            key -> CompletableFuture.supplyAsync(() -> (Object) redisReader.get(), hotKeyExecutor)
+                .orTimeout(inflightTimeoutSeconds, TimeUnit.SECONDS)
+                .whenComplete((_, _) -> inflightLoads.invalidate(key)));
 
-    return Optional.ofNullable((T) loadFuture.join())
-        .map(value -> {
-          if (hotKeyDetector.add(cacheKey, 1).isHotKey()) {
-            caffeineCache.put(cacheKey, value);
-            if (softExpireAt != null) {
-              softExpireAt.put(cacheKey, System.currentTimeMillis() + softTtlMs);
-            }
-            broadcastPublisher.ifPresent(p -> p.broadcastHotKey(cacheKey));
-            log.debug("HotKey detected and loaded into local caffeine cache: {}", cacheKey);
+    try {
+      return Optional.ofNullable((T) loadFuture.join()).map(value -> {
+        if (hotKeyDetector.add(cacheKey, 1).isHotKey()) {
+          caffeineCache.put(cacheKey, value);
+          if (softExpireAt != null) {
+            softExpireAt.put(cacheKey, System.currentTimeMillis() + softTtlMs);
           }
-          return value;
-        });
+          // Broadcast requires the Broadcast module to be enabled
+          broadcastPublisher.ifPresent(p -> p.broadcastHotKey(cacheKey));
+          log.debug("HotKey detected and loaded into local caffeine cache: {}", cacheKey);
+        }
+        return value;
+      });
+    } catch (Exception e) {
+      inflightLoads.invalidate(cacheKey);
+      return Optional.empty();
+    }
   }
 
   private <T> void triggerAsyncRefresh(String cacheKey, Supplier<T> redisReader) {

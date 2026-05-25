@@ -35,6 +35,7 @@ It uses [HeavyKeeper](https://github.com/go-kratos/aegis) (a Count-Min Sketch va
 - **In-Flight Dedup** — concurrent L1 miss requests share a single Redis read via `Caffeine<key, CompletableFuture>`
 
   > **Note:** Ensure `hotkey.inflight-ttl-seconds` exceeds the slowest Redis response time for your workload, or the cache entry may expire before the future completes, causing duplicate Redis reads.
+  > Also ensure `hotkey.inflight-timeout-seconds` < `hotkey.inflight-ttl-seconds`. On timeout, `loadSingleflight` returns `Optional.empty()` — the caller should handle via DB fallback.
 - **Soft Expire** — return stale L1 value immediately while asynchronously refreshing in the background; lower p99 at the cost of short-lived staleness
 - **Redis Collections** — `invalidateAfterWriteSync` for List/Set/ZSet incremental writes; no `putAndBroadcast` needed
 - **Hot Key Broadcast** — optional RabbitMQ fanout to synchronize hot keys across instances
@@ -275,6 +276,7 @@ Each instance declares its own queue (`hotkey.broadcast:<pod-id>`) bound to a fa
 | `hotkey.local-cache-ttl-minutes` | `5` | Caffeine L1 TTL in minutes |
 | `hotkey.inflight-max-size` | `50000` | In-flight dedup max entries |
 | `hotkey.inflight-ttl-seconds` | `5` | In-flight dedup entry TTL (must exceed slowest Redis response) |
+| `hotkey.inflight-timeout-seconds` | `3` | Inflight load timeout (must be < inflight-ttl-seconds). On timeout returns `Optional.empty()` — caller should fallback to DB |
 | `hotkey.executor-core-pool-size` | `8` | Thread pool core size |
 | `hotkey.executor-max-pool-size` | `32` | Thread pool max size |
 | `hotkey.executor-queue-capacity` | `2000` | Thread pool queue capacity |

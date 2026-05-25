@@ -40,6 +40,9 @@ public class HotKeyProperties {
   private int inflightTtlSeconds = 5;
 
   @Min(1)
+  private int inflightTimeoutSeconds = 3;
+
+  @Min(1)
   private int executorCorePoolSize = 8;
 
   @Min(1)

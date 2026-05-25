@@ -24,30 +24,29 @@ public class HotKeyAutoConfiguration {
   @ConditionalOnMissingBean
   public TopK hotKeyDetector(HotKeyProperties properties) {
     return new HeavyKeeper(
-      properties.getTopK(),
-      properties.getWidth(),
-      properties.getDepth(),
-      properties.getDecay(),
-      properties.getMinCount()
-    );
+        properties.getTopK(),
+        properties.getWidth(),
+        properties.getDepth(),
+        properties.getDecay(),
+        properties.getMinCount());
   }
 
   @Bean
   @ConditionalOnMissingBean
   public Cache<String, Object> hotLocalCache(HotKeyProperties properties) {
     return Caffeine.newBuilder()
-      .maximumSize(properties.getLocalCacheMaxSize())
-      .expireAfterWrite(properties.getLocalCacheTtlMinutes(), TimeUnit.MINUTES)
-      .build();
+        .maximumSize(properties.getLocalCacheMaxSize())
+        .expireAfterWrite(properties.getLocalCacheTtlMinutes(), TimeUnit.MINUTES)
+        .build();
   }
 
   @Bean
   @ConditionalOnMissingBean
   public Cache<String, CompletableFuture<Object>> inflightLoads(HotKeyProperties properties) {
     return Caffeine.newBuilder()
-      .maximumSize(properties.getInflightMaxSize())
-      .expireAfterWrite(properties.getInflightTtlSeconds(), TimeUnit.SECONDS)
-      .build();
+        .maximumSize(properties.getInflightMaxSize())
+        .expireAfterWrite(properties.getInflightTtlSeconds(), TimeUnit.SECONDS)
+        .build();
   }
 
   @Bean
@@ -65,20 +64,19 @@ public class HotKeyAutoConfiguration {
   @Bean
   @ConditionalOnMissingBean
   public HotKeyCache hotKeyCache(
-    TopK hotKeyDetector,
-    Cache<String, Object> hotLocalCache,
-    Cache<String, CompletableFuture<Object>> inflightLoads,
-    Optional<io.github.hyshmily.hotkey.broadcast.BroadcastPublisher> broadcastPublisher,
-    Executor hotKeyExecutor,
-    HotKeyProperties properties
-  ) {
+      TopK hotKeyDetector,
+      Cache<String, Object> hotLocalCache,
+      Cache<String, CompletableFuture<Object>> inflightLoads,
+      Optional<io.github.hyshmily.hotkey.broadcast.BroadcastPublisher> broadcastPublisher,
+      Executor hotKeyExecutor,
+      HotKeyProperties properties) {
     return new HotKeyCache(
-      hotKeyDetector, hotLocalCache, inflightLoads, broadcastPublisher, hotKeyExecutor,
-      properties.getSoftTtlMs(),
-      properties.getRefreshConcurrency(),
-      properties.getSoftExpireMaxSize(),
-      properties.getSoftExpireTtlMinutes()
-    );
+        hotKeyDetector, hotLocalCache, inflightLoads, broadcastPublisher, hotKeyExecutor,
+        properties.getInflightTimeoutSeconds(),
+        properties.getSoftTtlMs(),
+        properties.getRefreshConcurrency(),
+        properties.getSoftExpireMaxSize(),
+        properties.getSoftExpireTtlMinutes());
   }
 
 }
