@@ -37,7 +37,7 @@ It uses [HeavyKeeper](https://github.com/go-kratos/aegis) (a Count-Min Sketch va
   > **Note:** Ensure `hotkey.inflight-ttl-seconds` exceeds the slowest Redis response time for your workload, or the cache entry may expire before the future completes, causing duplicate Redis reads.
   > Also ensure `hotkey.inflight-timeout-seconds` < `hotkey.inflight-ttl-seconds`. On timeout, `loadSingleflight` returns `Optional.empty()` — the caller should handle via DB fallback.
 - **Soft Expire** — return stale L1 value immediately while asynchronously refreshing in the background; lower p99 at the cost of short-lived staleness
-- **Redis Collections** — `invalidateAfterWriteSync` for List/Set/ZSet incremental writes; no `putAndBroadcast` needed
+- **Redis Collections** — `writeInvalidate` for List/Set/ZSet incremental writes; no `writeThrough` needed
 - **Hot Key Broadcast** — optional RabbitMQ fanout to synchronize hot keys across instances
 - **Configurable Thread Pool** — dedicated `TaskExecutor` with bounded queue
 - **Spring Boot Auto-Configuration** — drop-in dependency, zero boilerplate
@@ -69,18 +69,18 @@ Optional   Optional.empty()        │ total()       │ ← public
 ```
 
 Write path (user-initiated):
-`hotKeyCache.putAndBroadcast(cacheKey, value, writer)`
+`hotKeyCache.writeThrough(cacheKey, value, writer)`
 ├─ `writer.run()` — L2 write (caller-supplied Runnable)
 ├─ Caffeine local cache update
 └─ RabbitMQ fanout broadcast (if enabled)
 
 For incremental collection mutations (LPUSH, SADD, ZADD):
-`hotKeyCache.invalidateAfterWriteSync(cacheKey, mutation)`
+`hotKeyCache.writeInvalidate(cacheKey, mutation)`
 ├─ `mutation.run()` — L2 write (caller-supplied Runnable)
 ├─ Caffeine local cache **invalidate** (next read re-fetches)
 └─ RabbitMQ fanout broadcast (if enabled)
 
-Soft Expire Read Path (`getWithSoftExpire`):
+Soft Expire Read Path (`getWithStale`):
 
 ```
          ┌──────────────┐   L1 hit ┌───────────────┐
@@ -142,10 +142,10 @@ hotkey:
 @Autowired
 private HotKeyCache hotKeyCache;
 
-Optional<String> r = hotKeyCache.get("user:123"); // Caffeine L1 + hot key detection only
+Optional<String> r = hotKeyCache.peek("user:123"); // Caffeine L1 + hot key detection only
 ```
 
-Calls `get(cacheKey, () -> null)` — returns `Optional.empty()` if L1 miss, skips secondary storage entirely.
+Calls `peek(cacheKey)` — returns `Optional.empty()` if L1 miss, skips secondary storage entirely.
 
 **B. Two-level cache (Redis or any backend)**
 
@@ -157,7 +157,7 @@ private RedisTemplate<String, Object> redisTemplate;
 
 Optional<String> r = hotKeyCache.get("user:123", () -> redisTemplate.opsForValue().get("user:123"));
 
-hotKeyCache.putAndBroadcast("user:123", newValue, () -> redisTemplate.opsForValue().set("user:123", newValue));
+hotKeyCache.writeThrough("user:123", newValue, () -> redisTemplate.opsForValue().set("user:123", newValue));
 ```
 
 **C. Database fallback**
@@ -183,7 +183,7 @@ public class RedisHotKeyHelper {
     }
 
     public void set(String key, Object value) {
-        hotKeyCache.putAndBroadcast(key, value, () -> redisTemplate.opsForValue().set(key, value));
+        hotKeyCache.writeThrough(key, value, () -> redisTemplate.opsForValue().set(key, value));
     }
 }
 ```
@@ -198,7 +198,7 @@ User user = r.orElseGet(() -> createDefaultUser());
 
 **F. Redis collections (List, Set, ZSet)**
 
-`putAndBroadcast` requires the full new value for L1 update, but collection incremental operations (LPUSH, SADD, ZADD) modify only a single element — the caller cannot know the full collection state. Use `invalidateAfterWriteSync` to invalidate L1 after the mutation; the next `get()` re-fetches from Redis, ensuring consistency.
+`writeThrough` requires the full new value for L1 update, but collection incremental operations (LPUSH, SADD, ZADD) modify only a single element — the caller cannot know the full collection state. Use `writeInvalidate` to invalidate L1 after the mutation; the next `get()` re-fetches from Redis, ensuring consistency.
 
 ```java
 @Component
@@ -218,7 +218,7 @@ public class CollectionHotKeyCache {
     }
 
     public void sAdd(String key, Object... members) {
-        hotKeyCache.invalidateAfterWriteSync(key,
+        hotKeyCache.writeInvalidate(key,
             () -> redisTemplate.opsForSet().add(key, members));
     }
 
@@ -240,7 +240,7 @@ public class CollectionHotKeyCache {
 Soft expire returns the stale L1 value immediately while asynchronously refreshing in the background. Use when short-lived staleness is acceptable in exchange for lower p99 latency.
 
 ```java
-Optional<String> r = hotKeyCache.getWithSoftExpire("user:123",
+Optional<String> r = hotKeyCache.getWithStale("user:123",
     () -> redisTemplate.opsForValue().get("user:123"));
 // L1 hit + soft expired → returns stale value + triggers async refresh
 // L1 miss → singleflight load (same as get())

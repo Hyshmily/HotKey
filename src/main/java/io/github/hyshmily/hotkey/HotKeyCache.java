@@ -83,7 +83,7 @@ public class HotKeyCache {
     return cacheKey == null || cacheKey.isBlank();
   }
 
-  public <T> Optional<T> get(String cacheKey) {
+  public <T> Optional<T> peek(String cacheKey) {
     return get(cacheKey, () -> null);
   }
 
@@ -106,9 +106,9 @@ public class HotKeyCache {
   }
 
   @SuppressWarnings("unchecked")
-  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader) {
+  public <T> Optional<T> getWithStale(String cacheKey, Supplier<T> redisReader) {
     if (invalidCacheKey(cacheKey)) {
-      log.warn("getWithSoftExpire: invalid cacheKey");
+      log.warn("getWithStale: invalid cacheKey");
       return Optional.empty();
     }
     if (softExpireAt == null) {
@@ -132,9 +132,9 @@ public class HotKeyCache {
     return loadSingleflight(cacheKey, redisReader);
   }
 
-  public void putAndBroadcast(String cacheKey, Object value, Runnable redisWriter) {
+  public void writeThrough(String cacheKey, Object value, Runnable redisWriter) {
     if (invalidCacheKey(cacheKey)) {
-      log.warn("putAndBroadcast: invalid cacheKey");
+      log.warn("writeThrough: invalid cacheKey");
       return;
     }
     runAfterCommit(() -> {
@@ -146,16 +146,16 @@ public class HotKeyCache {
     });
   }
 
-  public void invalidateAfterWriteSync(String cacheKey, Runnable redisMutation) {
+  public void writeInvalidate(String cacheKey, Runnable redisMutation) {
     if (invalidCacheKey(cacheKey)) {
-      log.warn("invalidateAfterWriteSync: invalid cacheKey");
+      log.warn("writeInvalidate: invalid cacheKey");
       return;
     }
     Runnable task = () -> {
       try {
         redisMutation.run();
       } catch (Exception e) {
-        log.error("invalidateAfterWriteSync failed, skip local invalidate and broadcast: {}", cacheKey, e);
+        log.error("writeInvalidate failed, skip local invalidate and broadcast: {}", cacheKey, e);
         return;
       }
       caffeineCache.invalidate(cacheKey);
@@ -239,9 +239,9 @@ public class HotKeyCache {
           });
       return;
     }
-    log.warn("putAndBroadcast called outside transaction, submitting to async executor");
+    log.warn("writeThrough called outside transaction, submitting to async executor");
     CompletableFuture.runAsync(task, hotKeyExecutor).exceptionally(e -> {
-      log.error("Async Redis write failed after non-transactional putAndBroadcast", e);
+      log.error("Async Redis write failed after non-transactional writeThrough", e);
       return null;
     });
   }
