@@ -144,35 +144,35 @@ public class HotKeyCache {
 
     return loadSingleflight(cacheKey, redisReader);
   }
+
   public void invalidateOrUpdate(String cacheKey) {
-      putInvalidate(cacheKey, () -> {
-        // No-op Redis mutation since we're only invalidating local cache
-      });
+    putInvalidate(cacheKey, () -> {
+      // No-op Redis mutation since we're only invalidating local cache,null
+    });
   }
 
   public void invalidateAll(Collection<String> cacheKeys) {
     List<String> validKeys = cacheKeys.stream()
-            .filter(k -> !invalidCacheKey(k))
-            .toList();
+        .filter(k -> !invalidCacheKey(k))
+        .toList();
     if (validKeys.isEmpty()) {
       log.warn("invalidateAll: all cacheKeys are invalid");
       return;
     }
     Runnable task = () -> {
       caffeineCache.invalidateAll(validKeys);
-      validKeys.forEach(key ->
-              broadcastPublisher.ifPresentOrElse(
-                      p -> p.invalidateHotKey(key),
-                      () -> log.debug("No broadcast publisher found, please enable Broadcast")));
+      validKeys.forEach(key -> broadcastPublisher.ifPresentOrElse(
+          p -> p.invalidateHotKey(key),
+          () -> log.debug("No broadcast publisher found, please enable Broadcast")));
     };
     if (TransactionSynchronizationManager.isSynchronizationActive()) {
       TransactionSynchronizationManager.registerSynchronization(
-              new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                  task.run();
-                }
-              });
+          new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+              task.run();
+            }
+          });
       return;
     }
     task.run();
