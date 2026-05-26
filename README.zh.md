@@ -262,7 +262,40 @@ hotkey:
 
 每个实例声明独立队列（`hotkey.broadcast:<pod-id>`）绑定到 fanout 交换机。热点提升时广播 key 通知对端，对端首次收到后从 Redis 回读。失效广播立即清除本地缓存。
 
-### 5. 配置属性参考
+### 5. 监控（Actuator）
+
+当 classpath 包含 `spring-boot-starter-actuator` 时，HotKey Endpoint 自动注册在 `/actuator/hotkey`。
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,hotkey
+```
+
+```json
+{
+  "topK": [{"key": "cache:shop:17", "count": 1523}],
+  "topKCount": 1,
+  "totalRequests": 158392,
+  "l1CacheSize": 87,
+  "l1MaxSize": 1000,
+  "inflightSize": 3,
+  "recentlyExpelled": ["cache:shop:5", "cache:shop:99"]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `topK` | 当前 TopK 热点 key 列表（按计数降序） |
+| `topKCount` | 热点 key 数量 |
+| `totalRequests` | 累计经过 HotKey 检测的请求总数 |
+| `l1CacheSize` / `l1MaxSize` | L1 Caffeine 当前大小 / 最大限制 |
+| `inflightSize` | 当前 inflight dedup 中的请求数 |
+| `recentlyExpelled` | 最近被挤出 TopK 的 key（最近 10 个） |
+
+### 6. 配置属性参考
 
 | 属性 | 默认值 | 说明 |
 |---|---|---|
@@ -298,6 +331,7 @@ hotkey:
 | `algorithm` | 无 | 始终生效 |
 | `cache` (Redis) | `spring-boot-starter-data-redis` | `@ConditionalOnClass` |
 | `broadcast` (RabbitMQ) | `spring-boot-starter-amqp` | `@ConditionalOnClass` + 属性开关 |
+| `actuator` | `spring-boot-starter-actuator` | `@ConditionalOnClass` |
 
 
 ## 许可证

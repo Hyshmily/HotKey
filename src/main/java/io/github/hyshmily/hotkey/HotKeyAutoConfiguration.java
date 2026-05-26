@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
@@ -49,8 +50,8 @@ public class HotKeyAutoConfiguration {
         .build();
   }
 
-  @Bean
-  @ConditionalOnMissingBean
+  @Bean("hotKeyExecutor")
+  @ConditionalOnMissingBean(name = "hotKeyExecutor")
   public Executor hotKeyExecutor(HotKeyProperties properties) {
     ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
     executor.setCorePoolSize(properties.getExecutorCorePoolSize());
@@ -68,7 +69,7 @@ public class HotKeyAutoConfiguration {
       Cache<String, Object> hotLocalCache,
       Cache<String, CompletableFuture<Object>> inflightLoads,
       Optional<io.github.hyshmily.hotkey.broadcast.BroadcastPublisher> broadcastPublisher,
-      Executor hotKeyExecutor,
+      @Qualifier("hotKeyExecutor") Executor hotKeyExecutor,
       HotKeyProperties properties) {
     return new HotKeyCache(
         hotKeyDetector, hotLocalCache, inflightLoads, broadcastPublisher, hotKeyExecutor,

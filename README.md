@@ -263,7 +263,40 @@ hotkey:
 
 Each instance declares its own queue (`hotkey.broadcast:<pod-id>`) bound to a fanout exchange. When a hot key is promoted, the instance broadcasts the key. Peers load the value from Redis on first broadcast miss. Invalidations remove the local cache entry immediately.
 
-### 5. Configuration Reference
+### 5. Monitoring (Actuator)
+
+When `spring-boot-starter-actuator` is on the classpath, the HotKey endpoint is automatically registered at `/actuator/hotkey`.
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,hotkey
+```
+
+```json
+{
+  "topK": [{"key": "cache:shop:17", "count": 1523}],
+  "topKCount": 1,
+  "totalRequests": 158392,
+  "l1CacheSize": 87,
+  "l1MaxSize": 1000,
+  "inflightSize": 3,
+  "recentlyExpelled": ["cache:shop:5", "cache:shop:99"]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `topK` | Current Top-K hot keys (descending by count) |
+| `topKCount` | Number of hot keys in Top-K set |
+| `totalRequests` | Total requests passed through HotKey detection |
+| `l1CacheSize` / `l1MaxSize` | L1 Caffeine current size / max limit |
+| `inflightSize` | Current in-flight dedup requests |
+| `recentlyExpelled` | Recently evicted keys from Top-K (up to 10) |
+
+### 6. Configuration Reference
 
 | Property | Default | Description |
 |---|---|---|
@@ -299,6 +332,7 @@ Each instance declares its own queue (`hotkey.broadcast:<pod-id>`) bound to a fa
 | `algorithm` | none | always |
 | `cache` (Redis) | `spring-boot-starter-data-redis` | `@ConditionalOnClass` |
 | `broadcast` (RabbitMQ) | `spring-boot-starter-amqp` | `@ConditionalOnClass` + property |
+| `actuator` | `spring-boot-starter-actuator` | `@ConditionalOnClass` |
 
 
 
