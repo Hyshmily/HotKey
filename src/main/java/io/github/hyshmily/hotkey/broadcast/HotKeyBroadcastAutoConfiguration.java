@@ -16,24 +16,18 @@ import org.springframework.data.redis.core.RedisTemplate;
 @ConditionalOnProperty(prefix = "hotkey.broadcast", name = "enabled", havingValue = "true")
 public class HotKeyBroadcastAutoConfiguration {
 
-  private final BroadcastProperties properties;
-
-  public HotKeyBroadcastAutoConfiguration(BroadcastProperties properties) {
-    this.properties = properties;
-  }
-
   @Bean
   public BroadcastProperties broadcastProperties() {
     return new BroadcastProperties();
   }
 
   @Bean
-  public FanoutExchange hotkeyBroadcastExchange() {
+  public FanoutExchange hotkeyBroadcastExchange(BroadcastProperties properties) {
     return new FanoutExchange(properties.getExchangeName(), true, false);
   }
 
   @Bean
-  public Queue hotkeyBroadcastQueue() {
+  public Queue hotkeyBroadcastQueue(BroadcastProperties properties) {
     return QueueBuilder.durable(properties.getQueueName()).build();
   }
 
@@ -47,7 +41,8 @@ public class HotKeyBroadcastAutoConfiguration {
   @Bean
   @ConditionalOnMissingBean
   public BroadcastPublisher broadcastPublisher(
-      RabbitTemplate rabbitTemplate) {
+      RabbitTemplate rabbitTemplate,
+      BroadcastProperties properties) {
     return new BroadcastPublisher(rabbitTemplate, properties);
   }
 
@@ -61,7 +56,8 @@ public class HotKeyBroadcastAutoConfiguration {
   @ConditionalOnMissingBean
   public BroadcastListener broadcastListener(
       Cache<String, Object> hotLocalCache,
-      Function<String, Object> hotKeyRedisLoader) {
+      Function<String, Object> hotKeyRedisLoader,
+      BroadcastProperties properties) {
     return new BroadcastListener(hotLocalCache, hotKeyRedisLoader, properties);
   }
 }
