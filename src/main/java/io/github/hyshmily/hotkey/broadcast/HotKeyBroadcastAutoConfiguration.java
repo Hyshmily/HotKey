@@ -8,7 +8,6 @@ import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.data.redis.core.RedisTemplate;
 
@@ -24,7 +23,6 @@ public class HotKeyBroadcastAutoConfiguration {
   }
 
   @Bean
-  @ConfigurationProperties(prefix = "hotkey.broadcast")
   public BroadcastProperties broadcastProperties() {
     return new BroadcastProperties();
   }
