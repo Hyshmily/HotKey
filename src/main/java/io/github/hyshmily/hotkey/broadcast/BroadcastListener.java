@@ -14,7 +14,6 @@ import java.util.function.Function;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
-import org.springframework.amqp.rabbit.annotation.RabbitListener;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -24,7 +23,6 @@ public class BroadcastListener {
   private final Function<String, Object> redisLoader;
   private final BroadcastProperties properties;
 
-  @RabbitListener(queues = "#{@broadcastProperties.queueName}", ackMode = "MANUAL")
   public void handleHotKeyMessage(Channel channel, Message msg) throws IOException {
     long tag = msg.getMessageProperties().getDeliveryTag();
     try {

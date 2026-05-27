@@ -299,7 +299,7 @@ hotkey:
 
 ## HotKey API Reference
 
-The recommended entry point is the `HotKey` facade (auto-configured as a Spring bean). Beyond the `get`/`peek`/`putThrough`/`putBeforeInvalidate` shown above, it exposes:
+The recommended entry point is the `HotKey` facade (auto-configured as a Spring bean). Beyond the `get`/`peek`/`putThrough`/`putInvalidate` shown above, it exposes:
 
 | Method | Description |
 |--------|-------------|
@@ -352,6 +352,78 @@ management:
 | `l1CacheSize` / `l1MaxSize` | L1 Caffeine current size / max limit |
 | `inflightSize` | Current in-flight dedup requests |
 | `recentlyExpelled` | Recently evicted keys from Top-K (up to 10) |
+
+## Troubleshooting
+
+### HotKeyCache bean not created when Redis is on the classpath
+
+**Symptom**: Application context fails with:
+
+```
+Field hotKey in com.example.SomeService required a bean of type
+'io.github.hyshmily.hotkey.hotkeycache.HotKeyCache' that could not be found.
+```
+
+**Root cause**:
+
+Two auto-configuration classes compete to create the `HotKeyCache` bean. When `spring-boot-starter-data-redis` is on the classpath, both can be skipped:
+
+| Class | Condition on `hotKeyCache()` | Why it skips |
+|---|---|---|
+| `HotKeyAutoConfiguration` | `@ConditionalOnMissingBean(type = "RedisTemplate")` | A `RedisTemplate` bean exists in the context (auto-configured by Redis starter) |
+| `HotKeyRedisAutoConfiguration` | `@AutoConfiguration(after = ...)` + `@ConditionalOnBean(StringRedisTemplate.class)` | Runs **after** `HotKeyAutoConfiguration`. By the time its `HotKeyCache` is registered, `HotKeyAutoConfiguration`'s `hotKey()` method — which has `@ConditionalOnBean(HotKeyCache.class)` — has already evaluated to **false** |
+
+Gap: `HotKeyRedisAutoConfiguration` creates `HotKeyCache`, but nobody creates the `HotKey` facade bean.
+
+**Workaround** — define both beans manually in your project:
+
+```java
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import com.github.benmanes.caffeine.cache.Cache;
+import io.github.hyshmily.hotkey.HotKey;
+import io.github.hyshmily.hotkey.algorithm.TopK;
+import io.github.hyshmily.hotkey.hotkeycache.HotKeyCache;
+import io.github.hyshmily.hotkey.hotkeycache.HotKeyProperties;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class HotKeyConfig {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public HotKeyCache hotKeyCache(
+            TopK hotKeyDetector,
+            Cache<String, Object> hotLocalCache,
+            Cache<String, CompletableFuture<Object>> inflightLoads,
+            @Qualifier("hotKeyExecutor") Executor hotKeyExecutor,
+            HotKeyProperties properties
+    ) {
+        return new HotKeyCache(
+            hotKeyDetector, hotLocalCache, inflightLoads,
+            Optional.empty(), hotKeyExecutor,
+            properties.getInflightTimeoutSeconds(),
+            properties.getSoftTtlMs(),
+            properties.getRefreshConcurrency(),
+            properties.getSoftExpireMaxSize(),
+            properties.getSoftExpireTtlMinutes(),
+            properties.getVersionKeyTtlMinutes()
+        );
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public HotKey hotKey(HotKeyCache hotKeyCache, TopK hotKeyDetector) {
+        return new HotKey(hotKeyCache, hotKeyDetector);
+    }
+}
+```
+
+`@ConditionalOnMissingBean` ensures these beans only kick in when the library's auto-configuration fails — no conflict, no duplication.
 
 ## Configuration Reference
 

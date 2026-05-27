@@ -3,7 +3,10 @@ package io.github.hyshmily.hotkey.broadcast;
 import com.github.benmanes.caffeine.cache.Cache;
 import java.util.function.Function;
 import org.springframework.amqp.core.*;
+import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.rabbit.listener.SimpleMessageListenerContainer;
+import org.springframework.amqp.rabbit.listener.api.ChannelAwareMessageListener;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -56,5 +59,18 @@ public class HotKeyBroadcastAutoConfiguration {
       Function<String, Object> hotKeyRedisLoader,
       BroadcastProperties properties) {
     return new BroadcastListener(hotLocalCache, hotKeyRedisLoader, properties);
+  }
+
+  @Bean
+  public SimpleMessageListenerContainer broadcastListenerContainer(
+      ConnectionFactory connectionFactory,
+      BroadcastListener broadcastListener,
+      BroadcastProperties properties) {
+    SimpleMessageListenerContainer container = new SimpleMessageListenerContainer(connectionFactory);
+    container.setQueueNames(properties.getQueueName());
+    container.setAcknowledgeMode(AcknowledgeMode.MANUAL);
+    container.setMessageListener((ChannelAwareMessageListener) (msg, channel) ->
+        broadcastListener.handleHotKeyMessage(channel, msg));
+    return container;
   }
 }

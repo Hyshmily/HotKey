@@ -301,7 +301,7 @@ hotkey:
 
 ## HotKey 门面 API 参考
 
-推荐入口是 `HotKey` 门面（已自动配置为 Spring Bean）。除了上面展示的 `get`/`peek`/`putThrough`/`putBeforeInvalidate` 之外，还提供：
+推荐入口是 `HotKey` 门面（已自动配置为 Spring Bean）。除了上面展示的 `get`/`peek`/`putThrough`/`putInvalidate` 之外，还提供：
 
 | 方法                          | 说明                                    |
 | ----------------------------- | --------------------------------------- |
@@ -355,9 +355,81 @@ management:
 | `inflightSize`              | 当前 inflight dedup 中的请求数        |
 | `recentlyExpelled`          | 最近被挤出 TopK 的 key（最近 10 个）  |
 
+## 常见问题
+
+### 引入 Redis 依赖后 HotKeyCache Bean 无法创建
+
+**现象**：应用启动失败，报错：
+
+```
+Field hotKey in com.example.SomeService required a bean of type
+'io.github.hyshmily.hotkey.hotkeycache.HotKeyCache' that could not be found.
+```
+
+**根因**：
+
+两个自动配置类竞争创建 `HotKeyCache` Bean。当 `spring-boot-starter-data-redis` 在 classpath 上时，两者都可能被跳过：
+
+| 配置类 | `hotKeyCache()` 的生效条件 | 跳过原因 |
+|---|---|---|
+| `HotKeyAutoConfiguration` | `@ConditionalOnMissingBean(type = "RedisTemplate")` | 上下文中存在 `RedisTemplate` Bean（Redis starter 自动配置） |
+| `HotKeyRedisAutoConfiguration` | `@AutoConfiguration(after = ...)` + `@ConditionalOnBean(StringRedisTemplate.class)` | 在 `HotKeyAutoConfiguration` **之后**执行。等它的 `HotKeyCache` 注册时，`HotKeyAutoConfiguration` 的 `hotKey()` 方法（带有 `@ConditionalOnBean(HotKeyCache.class)`）已经评估为 **false** |
+
+结果：`HotKeyRedisAutoConfiguration` 创建了 `HotKeyCache`，但没有人创建 `HotKey` 门面 Bean。
+
+**解决方案** — 在项目中手动定义两个 Bean：
+
+```java
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import com.github.benmanes.caffeine.cache.Cache;
+import io.github.hyshmily.hotkey.HotKey;
+import io.github.hyshmily.hotkey.algorithm.TopK;
+import io.github.hyshmily.hotkey.hotkeycache.HotKeyCache;
+import io.github.hyshmily.hotkey.hotkeycache.HotKeyProperties;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class HotKeyConfig {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public HotKeyCache hotKeyCache(
+            TopK hotKeyDetector,
+            Cache<String, Object> hotLocalCache,
+            Cache<String, CompletableFuture<Object>> inflightLoads,
+            @Qualifier("hotKeyExecutor") Executor hotKeyExecutor,
+            HotKeyProperties properties
+    ) {
+        return new HotKeyCache(
+            hotKeyDetector, hotLocalCache, inflightLoads,
+            Optional.empty(), hotKeyExecutor,
+            properties.getInflightTimeoutSeconds(),
+            properties.getSoftTtlMs(),
+            properties.getRefreshConcurrency(),
+            properties.getSoftExpireMaxSize(),
+            properties.getSoftExpireTtlMinutes(),
+            properties.getVersionKeyTtlMinutes()
+        );
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public HotKey hotKey(HotKeyCache hotKeyCache, TopK hotKeyDetector) {
+        return new HotKey(hotKeyCache, hotKeyDetector);
+    }
+}
+```
+
+`@ConditionalOnMissingBean` 确保这两个 Bean 仅在库的自动配置失败时才生效——不会冲突，也不会重复。
+
 ## 配置属性参考
 
-| 属性                                    | 默认值                                               | 说明                                                                                          |
+| 属性 | 默认值 | 说明 |
 | --------------------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `hotkey.top-k`                          | `100`                                                | Top-K 集合大小                                                                                |
 | `hotkey.width`                          | `50000`                                              | Count-Min Sketch 宽度                                                                         |
