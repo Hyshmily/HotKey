@@ -144,7 +144,7 @@ hotKey.get(key, supplier)
 </repositories>
 
 <dependency>
-    <groupId>com.github.hyshmily</groupId>
+    <groupId>io.github.hyshmily</groupId>
     <artifactId>hotkey</artifactId>
     <version>1.0.8</version>
 </dependency>
