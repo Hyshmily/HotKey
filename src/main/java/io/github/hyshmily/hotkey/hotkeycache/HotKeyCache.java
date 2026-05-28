@@ -127,12 +127,12 @@ public class HotKeyCache {
     );
   }
 
-  public <T> Optional<T> get(String cacheKey, Supplier<T> redisReader) {
-    return get(cacheKey, redisReader, Long.MAX_VALUE);
+  public <T> Optional<T> get(String cacheKey, Supplier<T> reader) {
+    return get(cacheKey, reader, Long.MAX_VALUE);
   }
 
   @SuppressWarnings("unchecked")
-  public <T> Optional<T> get(String cacheKey, Supplier<T> redisReader, long ttlMs) {
+  public <T> Optional<T> get(String cacheKey, Supplier<T> reader, long ttlMs) {
     if (invalidCacheKey(cacheKey)) {
       log.warn("get: invalid cacheKey");
       return Optional.empty();
@@ -145,22 +145,22 @@ public class HotKeyCache {
 
         return val;
       })
-      .or(() -> loadSingleflight(cacheKey, redisReader, ttlMs));
+      .or(() -> loadSingleflight(cacheKey, reader, ttlMs));
   }
 
-  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader) {
-    return getWithSoftExpire(cacheKey, redisReader, this.softTtlMs);
+  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> reader) {
+    return getWithSoftExpire(cacheKey, reader, this.softTtlMs);
   }
 
   @SuppressWarnings("unchecked")
-  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader, long softTtlMs) {
+  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> reader, long softTtlMs) {
     if (invalidCacheKey(cacheKey)) {
       log.warn("getWithStale: invalid cacheKey");
       return Optional.empty();
     }
     if (softExpireAt == null) {
       log.warn("Soft expire not enabled (softTtlMs=0), fallback to get()");
-      return get(cacheKey, redisReader);
+      return get(cacheKey, reader);
     }
 
     return Optional.ofNullable(caffeineCache.getIfPresent(cacheKey))
@@ -169,14 +169,14 @@ public class HotKeyCache {
         Long expireAt = softExpireAt.getIfPresent(cacheKey);
 
         if (expireAt == null || expireAt < System.currentTimeMillis()) {
-          triggerAsyncRefresh(cacheKey, redisReader, softTtlMs);
+          triggerAsyncRefresh(cacheKey, reader, softTtlMs);
         }
 
         hotKeyDetector.add(cacheKey, 1);
 
         return cached;
       })
-      .or(() -> loadSingleflight(cacheKey, redisReader));
+      .or(() -> loadSingleflight(cacheKey, reader));
   }
 
   public void invalidate(String cacheKey) {
@@ -291,16 +291,16 @@ public class HotKeyCache {
     task.run();
   }
 
-  private <T> Optional<T> loadSingleflight(String cacheKey, Supplier<T> redisReader) {
-    return loadSingleflight(cacheKey, redisReader, Long.MAX_VALUE);
+  private <T> Optional<T> loadSingleflight(String cacheKey, Supplier<T> reader) {
+    return loadSingleflight(cacheKey, reader, Long.MAX_VALUE);
   }
 
   @SuppressWarnings("unchecked")
-  private <T> Optional<T> loadSingleflight(String cacheKey, Supplier<T> redisReader, long ttlMs) {
+  private <T> Optional<T> loadSingleflight(String cacheKey, Supplier<T> reader, long ttlMs) {
     CompletableFuture<Object> loadFuture = inflightLoads
       .asMap()
       .computeIfAbsent(cacheKey, key ->
-        CompletableFuture.supplyAsync(() -> (Object) redisReader.get(), hotKeyExecutor)
+        CompletableFuture.supplyAsync(() -> (Object) reader.get(), hotKeyExecutor)
           .orTimeout(inflightTimeoutSeconds, TimeUnit.SECONDS)
           .whenComplete((value, error) -> {
             inflightLoads.invalidate(key);
@@ -331,13 +331,13 @@ public class HotKeyCache {
     }
   }
 
-  private <T> void triggerAsyncRefresh(String cacheKey, Supplier<T> redisReader, long softTtlMs) {
+  private <T> void triggerAsyncRefresh(String cacheKey, Supplier<T> reader, long softTtlMs) {
     if (!refreshLimiter.tryAcquire()) {
       log.debug("Refresh limiter blocked, skip async refresh: {}", cacheKey);
       return;
     }
 
-    CompletableFuture.supplyAsync(() -> (Object) redisReader.get(), hotKeyExecutor).whenComplete((value, error) -> {
+    CompletableFuture.supplyAsync(() -> (Object) reader.get(), hotKeyExecutor).whenComplete((value, error) -> {
       try {
         if (error != null) {
           log.warn("Async soft refresh failed: {}", cacheKey, error);

@@ -37,20 +37,20 @@ public class HotKey {
     return hotKeyCache.peek(cacheKey);
   }
 
-  public <T> Optional<T> get(String cacheKey, Supplier<T> redisReader) {
-    return hotKeyCache.get(cacheKey, redisReader);
+  public <T> Optional<T> get(String cacheKey, Supplier<T> reader) {
+    return hotKeyCache.get(cacheKey, reader);
   }
 
-  public <T> Optional<T> get(String cacheKey, Supplier<T> redisReader, long ttlMs) {
-    return hotKeyCache.get(cacheKey, redisReader, ttlMs);
+  public <T> Optional<T> get(String cacheKey, Supplier<T> reader, long ttlMs) {
+    return hotKeyCache.get(cacheKey, reader, ttlMs);
   }
 
-  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader) {
-    return hotKeyCache.getWithSoftExpire(cacheKey, redisReader);
+  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> reader) {
+    return hotKeyCache.getWithSoftExpire(cacheKey, reader);
   }
 
-  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader, long softTtlMs) {
-    return hotKeyCache.getWithSoftExpire(cacheKey, redisReader, softTtlMs);
+  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> reader, long softTtlMs) {
+    return hotKeyCache.getWithSoftExpire(cacheKey, reader, softTtlMs);
   }
 
   public void invalidate(String cacheKey) {

@@ -56,7 +56,7 @@ It uses [HeavyKeeper](https://github.com/go-kratos/aegis) (a Count-Min Sketch va
 └──────┬───────┘   Optional.of(value)  └──────┬───────┘
        │ L1 miss           (auto unwrap       │ isHotKey()?
        ↓ (inflight dedup)  CacheEntry)        ↓
-┌──────────────┐   redisReader     ┌───────────────┐
+┌──────────────┐    reader         ┌───────────────┐
 │  L2 Storage  │ ←───────────────  │     TopK      │
 │  (pluggable) │ ───────────────→  │  (interface)  │
 └──┬───────┬───┘  add(key,1)       ├───────────────┤
@@ -105,7 +105,7 @@ Soft Expire Read Path (`getWithSoftExpire`):
                 │                            + update softExpireAt
                  │ L1 miss (falls through to normal path)
                  ↓
-            loadSingleflight(cacheKey, redisReader)
+            loadSingleflight(cacheKey, reader)
             (see Normal Read Path above)
             Caffeine.put(key, CacheEntry(value, 0L, keepExpireAt))
 ```
