@@ -53,9 +53,4 @@ public class HotKeyRedisAutoConfiguration {
     );
   }
 
-  @Bean
-  @ConditionalOnMissingBean
-  public HotKey hotKey(HotKeyCache hotKeyCache, TopK hotKeyDetector) {
-    return new HotKey(hotKeyCache, hotKeyDetector);
-  }
 }
