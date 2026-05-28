@@ -41,8 +41,16 @@ public class HotKey {
     return hotKeyCache.get(cacheKey, redisReader);
   }
 
+  public <T> Optional<T> get(String cacheKey, Supplier<T> redisReader, long ttlMs) {
+    return hotKeyCache.get(cacheKey, redisReader, ttlMs);
+  }
+
   public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader) {
     return hotKeyCache.getWithSoftExpire(cacheKey, redisReader);
+  }
+
+  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader, long softTtlMs) {
+    return hotKeyCache.getWithSoftExpire(cacheKey, redisReader, softTtlMs);
   }
 
   public void invalidate(String cacheKey) {
@@ -59,6 +67,10 @@ public class HotKey {
 
   public <T> void putThrough(String cacheKey, T value, Runnable redisWriter) {
     hotKeyCache.putThrough(cacheKey, value, redisWriter);
+  }
+
+  public <T> void putThrough(String cacheKey, T value, Runnable redisWriter, long ttlMs) {
+    hotKeyCache.putThrough(cacheKey, value, redisWriter, ttlMs);
   }
 
   public void putBeforeInvalidate(String cacheKey, Runnable redisMutation) {

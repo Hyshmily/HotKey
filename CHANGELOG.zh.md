@@ -2,6 +2,17 @@
 
 所有重要变更均记录在此文件中。
 
+## 1.0.8
+
+- **Per-entry 硬 TTL** — `get(key, reader, ttlMs)` 和 `putThrough(key, value, writer, ttlMs)` 支持为单个 entry 设置 Caffeine 硬 TTL（毫秒）。未传 ttlMs 的调用仍使用全局 `hotkey.local-cache-ttl-minutes`。
+- **Per-call 软 TTL** — `getWithSoftExpire(key, reader, softTtlMs)` 支持按调用覆盖全局 `hotkey.soft-ttl-ms`。
+- **`VersionedValue` → `CacheEntry`** — 内部缓存条目类型新增 `expireAtMs` 字段，与 `value`、`version` 并列。`VersionedValue` 已删除。
+- **`expireAfter(Expiry)`** — Caffeine L1 缓存构建从固定 `expireAfterWrite` 改为 per-entry `Expiry` 回调，支持条目级变量 TTL。
+- **委托重构** — `get()`、`putThrough()`、`loadSingleflight()` 的无参重载委托给带 `ttlMs` 的版本，消除重复校验和日志。
+- **软过期 TTL 保留** — `triggerAsyncRefresh` 刷新时保留原始 entry 的 `expireAtMs`，不再重置为 `Long.MAX_VALUE`，per-entry 硬 TTL 在后台刷新中保持不变。
+- **移除 `instance-id` YAML 配置** — `BroadcastProperties.instanceId` 无 setter（`@Setter(AccessLevel.NONE)`），YAML 中的 `hotkey.broadcast.instance-id` 实际无效，已从配置示例中移除。
+- **广播 TTL 保留** — `BroadcastListener.handleVersionedHotKey` 现在保留本地 entry 的 `expireAtMs`，不再重置为 `Long.MAX_VALUE`，per-entry 硬 TTL 在广播更新中保持不变。
+
 ## 1.0.7
 
 - **TreeMap Top-K** — HeavyKeeper 中用 `TreeMap` + `HashMap` 替代 `PriorityQueue`。所有 Top-K 操作（插入、删除、淘汰）从 O(K) 降为 O(K log K)，消除每次热点访问时的线性 `removeIf` 扫描。

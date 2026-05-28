@@ -148,11 +148,11 @@ Component failure behavior:
 <dependency>
     <groupId>com.github.hyshmily</groupId>
     <artifactId>hotkey</artifactId>
-    <version>1.0.7</version>
+    <version>1.0.8</version>
 </dependency>
 ```
 
-Use a Git tag as the version (e.g. `1.0.7`). Redis and RabbitMQ dependencies are optional — include them only if you need the corresponding features.
+Use a Git tag as the version (e.g. `1.0.8`). Redis and RabbitMQ dependencies are optional — include them only if you need the corresponding features.
 
 ### 2. Configure
 
@@ -169,7 +169,6 @@ hotkey:
     enabled: false
     exchange-name: hotkey.broadcast.exchange
     queue-prefix: hotkey.broadcast
-    instance-id: ${server.port}
 ```
 
 ### 3. Use
@@ -284,6 +283,10 @@ Optional<String> r = hotKey.getWithSoftExpire("user:123",
     () -> redisTemplate.opsForValue().get("user:123"));
 // L1 hit + soft expired → returns stale value + triggers async refresh
 // L1 miss → singleflight load (same as get())
+
+// Per-call custom soft TTL (overrides global hotkey.soft-ttl-ms)
+Optional<String> r2 = hotKey.getWithSoftExpire("user:456",
+    () -> redisTemplate.opsForValue().get("user:456"), 3000);
 ```
 
 Configuration:
@@ -293,12 +296,33 @@ hotkey:
   refresh-concurrency: 50         # limit concurrent async refreshes
 ```
 
+**H. Per-entry hard TTL**
+
+By default, all entries share the global `hotkey.local-cache-ttl-minutes`. Use `get(key, reader, ttlMs)` or `putThrough(key, value, writer, ttlMs)` to set a per-entry Caffeine hard TTL. Entries without a custom TTL remain governed by the global setting.
+
+```java
+// 5-minute hard TTL for this key
+Optional<Shop> shop = hotKey.get("shop:" + shopId,
+    () -> redisTemplate.opsForValue().get("shop:" + shopId),
+    TimeUnit.MINUTES.toMillis(5));
+
+// 30-second hard TTL via putThrough
+hotKey.putThrough("weather:" + city, weatherData,
+    () -> redisTemplate.opsForValue().set("weather:" + city, weatherData),
+    TimeUnit.SECONDS.toMillis(30));
+```
+
+> **Note:** When combined with `getWithSoftExpire`, the per-entry hard TTL is preserved across background refreshes. If a key was loaded with a custom `ttlMs`, subsequent soft-expire refreshes will keep the original hard expiry time rather than resetting to the global default.
+
 ## HotKey API Reference
 
 The recommended entry point is the `HotKey` facade (auto-configured as a Spring bean). Beyond the `get`/`peek`/`putThrough`/`putInvalidate` shown above, it exposes:
 
 | Method | Description |
 |--------|-------------|
+| `get(key, reader, ttlMs)` | Read with per-entry Caffeine hard TTL (ms) |
+| `putThrough(key, value, writer, ttlMs)` | Write-through with per-entry Caffeine hard TTL (ms) |
+| `getWithSoftExpire(key, reader, softTtlMs)` | Soft expire with per-call soft TTL (ms) |
 | `isHotKey(cacheKey)` | Check if a key is in the current Top-K hot set |
 | `invalidateAll(cacheKeys...)` | Varargs overload — invalidate multiple keys at once |
 | `invalidateAll(Collection)` | Collection overload |
@@ -444,7 +468,7 @@ public class HotKeyConfig {
 | `hotkey.broadcast.dedup-window-seconds` | `10` | Broadcast dedup window (seconds) |
 | `hotkey.broadcast.dedup-max-size` | `10000` | Broadcast dedup max entries |
 | `hotkey.decay-period` | `20` | (Deprecated) Decay period in seconds, backward compatibility only |
-| `hotkey.broadcast.instance-id` | `${server.port:instance}-${HOSTNAME:${random.uuid}}` | Unique instance identifier |
+| `hotkey.broadcast.instance-id` | auto-generated | Unique instance identifier (auto-generated from `server.port` + hostname/UUID, not configurable via YAML) |
 | `hotkey.soft-ttl-ms` | `0` | Soft expire TTL (ms), 0 = disabled |
 | `hotkey.soft-expire-max-size` | `50000` | Soft expire timestamp cache max entries |
 | `hotkey.soft-expire-ttl-minutes` | `60` | Soft expire timestamp cache internal entry TTL (minutes) |

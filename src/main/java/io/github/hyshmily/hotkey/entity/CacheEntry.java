@@ -5,8 +5,9 @@ import lombok.Getter;
 
 @Getter
 @AllArgsConstructor
-public class VersionedValue {
+public class CacheEntry {
 
   private final Object value;
   private final long version;
+  private final long expireAtMs;
 }

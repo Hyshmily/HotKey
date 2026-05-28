@@ -5,7 +5,7 @@ import static io.github.hyshmily.hotkey.broadcast.BroadcastProperties.TYPE_INVAL
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.rabbitmq.client.Channel;
-import io.github.hyshmily.hotkey.entity.VersionedValue;
+import io.github.hyshmily.hotkey.entity.CacheEntry;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ScheduledExecutorService;
@@ -63,7 +63,7 @@ public class BroadcastListener {
 
   private void handleVersionedHotKey(String cacheKey, long version) {
     Object existing = caffeineCache.getIfPresent(cacheKey);
-    if (existing instanceof VersionedValue vv && vv.getVersion() >= version) {
+    if (existing instanceof CacheEntry vv && vv.getVersion() >= version) {
       return;
     }
 
@@ -76,10 +76,11 @@ public class BroadcastListener {
     caffeineCache
       .asMap()
       .compute(cacheKey, (_, cur) -> {
-        if (cur instanceof VersionedValue vv && vv.getVersion() >= version) {
+        if (cur instanceof CacheEntry vv && vv.getVersion() >= version) {
           return cur;
         }
-        return new VersionedValue(value, version);
+        long keepExpireAt = (cur instanceof CacheEntry ce) ? ce.getExpireAtMs() : Long.MAX_VALUE;
+        return new CacheEntry(value, version, keepExpireAt);
       });
   }
 

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.8
+
+- **Per-Entry Hard TTL** — `get(key, reader, ttlMs)` and `putThrough(key, value, writer, ttlMs)` allow setting a per-entry Caffeine hard TTL (milliseconds). Entries without a custom TTL remain governed by the global `hotkey.local-cache-ttl-minutes`.
+- **Per-Call Soft TTL** — `getWithSoftExpire(key, reader, softTtlMs)` allows overriding the global `hotkey.soft-ttl-ms` on a per-call basis.
+- **`VersionedValue` → `CacheEntry`** — internal cache entry type now carries `expireAtMs` alongside `value` and `version`. `VersionedValue` removed.
+- **`expireAfter(Expiry)`** — Caffeine L1 cache builder switched from fixed `expireAfterWrite` to per-entry `Expiry` callback, enabling variable TTL across entries.
+- **Delegation Refactor** — `get()`, `putThrough()`, `loadSingleflight()` no-arg overloads now delegate to their `ttlMs` counterparts, eliminating duplicate validation and logging.
+- **Soft Expire TTL Preservation** — `triggerAsyncRefresh` now preserves the original entry's `expireAtMs` instead of resetting to `Long.MAX_VALUE`, keeping per-entry hard TTL intact across background refreshes.
+- **`instance-id` Removed from YAML** — `BroadcastProperties.instanceId` has no setter (`@Setter(AccessLevel.NONE)`); the YAML property `hotkey.broadcast.instance-id` was non-functional and has been removed from config examples.
+- **Broadcast TTL Preservation** — `BroadcastListener.handleVersionedHotKey` now preserves the local entry's `expireAtMs` instead of resetting to `Long.MAX_VALUE`, keeping per-entry hard TTL intact across broadcast updates.
+
 ## 1.0.7
 
 - **TreeMap Top-K** — replaced `PriorityQueue` with `TreeMap` + `HashMap` in HeavyKeeper. All Top-K operations (insert, delete, evict) are now O(log K) instead of O(K), eliminating the linear `removeIf` scan on every hot key access.

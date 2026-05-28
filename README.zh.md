@@ -146,11 +146,11 @@ hotKey.get(key, supplier)
 <dependency>
     <groupId>com.github.hyshmily</groupId>
     <artifactId>hotkey</artifactId>
-    <version>1.0.7</version>
+    <version>1.0.8</version>
 </dependency>
 ```
 
-版本号使用 Git tag（例如 `1.0.7`）。Redis 和 RabbitMQ 依赖均为可选——仅在使用对应功能时才需引入。
+版本号使用 Git tag（例如 `1.0.8`）。Redis 和 RabbitMQ 依赖均为可选——仅在使用对应功能时才需引入。
 
 ### 2. 配置
 
@@ -167,7 +167,6 @@ hotkey:
     enabled: false
     exchange-name: hotkey.broadcast.exchange
     queue-prefix: hotkey.broadcast
-    instance-id: ${server.port}
 ```
 
 ### 3. 使用
@@ -285,6 +284,10 @@ public class CollectionHotKeyCache {
 Optional<String> r = hotKey.getWithSoftExpire("user:123", () -> redisTemplate.opsForValue().get("user:123"));
 // L1 命中但已软过期 → 返回旧值 + 触发异步刷新
 // L1 未命中 → singleflight 回源（同 get()）
+
+// 自定义 per-call softTtl（覆盖全局 hotkey.soft-ttl-ms）
+Optional<String> r2 = hotKey.getWithSoftExpire("user:456",
+    () -> redisTemplate.opsForValue().get("user:456"), 3000);
 ```
 
 配置示例：
@@ -295,12 +298,33 @@ hotkey:
   refresh-concurrency: 50 # 限制异步刷新并发数
 ```
 
+**H. 自定义 per-entry 硬 TTL**
+
+默认所有 entry 共享全局 `hotkey.local-cache-ttl-minutes`。通过 `get(key, reader, ttlMs)` 或 `putThrough(key, value, writer, ttlMs)` 可为单个 entry 设置独立的 Caffeine 硬 TTL。未传 ttlMs 的调用仍使用全局配置。
+
+```java
+// 5 分钟硬 TTL
+Optional<Shop> shop = hotKey.get("shop:" + shopId,
+    () -> redisTemplate.opsForValue().get("shop:" + shopId),
+    TimeUnit.MINUTES.toMillis(5));
+
+// 30 秒硬 TTL
+hotKey.putThrough("weather:" + city, weatherData,
+    () -> redisTemplate.opsForValue().set("weather:" + city, weatherData),
+    TimeUnit.SECONDS.toMillis(30));
+```
+
+> **注意：** 与 `getWithSoftExpire` 配合使用时，per-entry 硬 TTL 在后台刷新中会被保留。如果 key 加载时设置了自定义 `ttlMs`，后续软过期刷新会保持原始硬过期时间，不会重置为全局默认值。
+
 ## HotKey 门面 API 参考
 
 推荐入口是 `HotKey` 门面（已自动配置为 Spring Bean）。除了上面展示的 `get`/`peek`/`putThrough`/`putInvalidate` 之外，还提供：
 
 | 方法                          | 说明                                    |
 | ----------------------------- | --------------------------------------- |
+| `get(key, reader, ttlMs)`     | 读取并设置 per-entry Caffeine 硬 TTL（毫秒） |
+| `putThrough(key, value, writer, ttlMs)` | 写入并设置 per-entry Caffeine 硬 TTL（毫秒） |
+| `getWithSoftExpire(key, reader, softTtlMs)` | 软失效读取，支持 per-call 软 TTL（毫秒） |
 | `isHotKey(cacheKey)`          | 检查 key 是否在当前的 Top-K 热点集合中  |
 | `invalidateAll(cacheKeys...)` | 可变参数重载 — 批量失效多个 key         |
 | `invalidateAll(Collection)`   | Collection 重载                         |
@@ -446,7 +470,7 @@ public class HotKeyConfig {
 | `hotkey.broadcast.dedup-window-seconds` | `10`                                                 | 广播去重窗口（秒）                                                                            |
 | `hotkey.broadcast.dedup-max-size`       | `10000`                                              | 广播去重最大条目数                                                                            |
 | `hotkey.decay-period`                   | `20`                                                 | （已废弃）衰减周期（秒），仅做向后兼容                                                        |
-| `hotkey.broadcast.instance-id`          | `${server.port:instance}-${HOSTNAME:${random.uuid}}` | 实例唯一标识                                                                                  |
+| `hotkey.broadcast.instance-id`          | 自动生成 | 实例唯一标识（由 `server.port` + hostname/UUID 自动生成，不可通过 YAML 配置）                  |
 | `hotkey.soft-ttl-ms`                    | `0`                                                  | 软失效 TTL（毫秒），0 = 禁用                                                                  |
 | `hotkey.soft-expire-max-size`           | `50000`                                              | 软失效时间表最大条目数                                                                        |
 | `hotkey.soft-expire-ttl-minutes`        | `60`                                                 | 软失效时间表内部条目 TTL（分钟）                                                              |

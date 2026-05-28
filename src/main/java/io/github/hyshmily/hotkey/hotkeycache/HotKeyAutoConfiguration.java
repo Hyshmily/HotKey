@@ -2,9 +2,11 @@ package io.github.hyshmily.hotkey.hotkeycache;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Expiry;
 import io.github.hyshmily.hotkey.HotKey;
 import io.github.hyshmily.hotkey.algorithm.HeavyKeeper;
 import io.github.hyshmily.hotkey.algorithm.TopK;
+import io.github.hyshmily.hotkey.entity.CacheEntry;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -39,9 +41,32 @@ public class HotKeyAutoConfiguration {
   @Bean
   @ConditionalOnMissingBean
   public Cache<String, Object> hotLocalCache(HotKeyProperties properties) {
+    long defaultTtlNanos = TimeUnit.MINUTES.toNanos(properties.getLocalCacheTtlMinutes());
     Caffeine<Object, Object> builder = Caffeine.newBuilder()
         .maximumSize(properties.getLocalCacheMaxSize())
-        .expireAfterWrite(properties.getLocalCacheTtlMinutes(), TimeUnit.MINUTES);
+        .expireAfter(new Expiry<Object, Object>() {
+          @Override
+          public long expireAfterCreate(Object key, Object value, long currentTimeNanos) {
+            if (value instanceof CacheEntry entry) {
+              if (entry.getExpireAtMs() == Long.MAX_VALUE) {
+                return defaultTtlNanos;
+              }
+              long remaining = TimeUnit.MILLISECONDS.toNanos(entry.getExpireAtMs() - System.currentTimeMillis());
+              return Math.max(1, remaining);
+            }
+            return defaultTtlNanos;
+          }
+
+          @Override
+          public long expireAfterUpdate(Object key, Object value, long currentTimeNanos, long currentDuration) {
+            return expireAfterCreate(key, value, currentTimeNanos);
+          }
+
+          @Override
+          public long expireAfterRead(Object key, Object value, long currentTimeNanos, long currentDuration) {
+            return currentDuration;
+          }
+        });
     if (properties.getLocalCacheAccessTtlMinutes() > 0) {
       builder.expireAfterAccess(properties.getLocalCacheAccessTtlMinutes(), TimeUnit.MINUTES);
     }

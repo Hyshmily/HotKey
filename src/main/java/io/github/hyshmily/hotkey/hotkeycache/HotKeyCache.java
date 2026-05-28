@@ -4,7 +4,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.hyshmily.hotkey.algorithm.TopK;
 import io.github.hyshmily.hotkey.broadcast.BroadcastPublisher;
-import io.github.hyshmily.hotkey.entity.VersionedValue;
+import io.github.hyshmily.hotkey.entity.CacheEntry;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -95,6 +95,10 @@ public class HotKeyCache {
     }
   }
 
+  private static long expireAt(long ttlMs) {
+    return ttlMs > 0 ? System.currentTimeMillis() + ttlMs : Long.MAX_VALUE;
+  }
+
   public static boolean invalidCacheKey(String cacheKey) {
     return cacheKey == null || cacheKey.isBlank();
   }
@@ -119,12 +123,16 @@ public class HotKeyCache {
     }
 
     return Optional.ofNullable(caffeineCache.getIfPresent(cacheKey)).map(raw ->
-      raw instanceof VersionedValue vv ? (T) vv.getValue() : (T) raw
+      raw instanceof CacheEntry vv ? (T) vv.getValue() : (T) raw
     );
   }
 
-  @SuppressWarnings("unchecked")
   public <T> Optional<T> get(String cacheKey, Supplier<T> redisReader) {
+    return get(cacheKey, redisReader, Long.MAX_VALUE);
+  }
+
+  @SuppressWarnings("unchecked")
+  public <T> Optional<T> get(String cacheKey, Supplier<T> redisReader, long ttlMs) {
     if (invalidCacheKey(cacheKey)) {
       log.warn("get: invalid cacheKey");
       return Optional.empty();
@@ -132,16 +140,20 @@ public class HotKeyCache {
 
     return Optional.ofNullable(caffeineCache.getIfPresent(cacheKey))
       .map(raw -> {
-        T val = raw instanceof VersionedValue vv ? (T) vv.getValue() : (T) raw;
+        T val = raw instanceof CacheEntry vv ? (T) vv.getValue() : (T) raw;
         hotKeyDetector.add(cacheKey, 1);
 
         return val;
       })
-      .or(() -> loadSingleflight(cacheKey, redisReader));
+      .or(() -> loadSingleflight(cacheKey, redisReader, ttlMs));
+  }
+
+  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader) {
+    return getWithSoftExpire(cacheKey, redisReader, this.softTtlMs);
   }
 
   @SuppressWarnings("unchecked")
-  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader) {
+  public <T> Optional<T> getWithSoftExpire(String cacheKey, Supplier<T> redisReader, long softTtlMs) {
     if (invalidCacheKey(cacheKey)) {
       log.warn("getWithStale: invalid cacheKey");
       return Optional.empty();
@@ -153,11 +165,11 @@ public class HotKeyCache {
 
     return Optional.ofNullable(caffeineCache.getIfPresent(cacheKey))
       .map(raw -> {
-        T cached = raw instanceof VersionedValue vv ? (T) vv.getValue() : (T) raw;
+        T cached = raw instanceof CacheEntry vv ? (T) vv.getValue() : (T) raw;
         Long expireAt = softExpireAt.getIfPresent(cacheKey);
 
         if (expireAt == null || expireAt < System.currentTimeMillis()) {
-          triggerAsyncRefresh(cacheKey, redisReader);
+          triggerAsyncRefresh(cacheKey, redisReader, softTtlMs);
         }
 
         hotKeyDetector.add(cacheKey, 1);
@@ -227,6 +239,10 @@ public class HotKeyCache {
   }
 
   public <T> void putThrough(String cacheKey, T value, Runnable redisWriter) {
+    putThrough(cacheKey, value, redisWriter, Long.MAX_VALUE);
+  }
+
+  public <T> void putThrough(String cacheKey, T value, Runnable redisWriter, long ttlMs) {
     if (invalidCacheKey(cacheKey)) {
       log.warn("putThrough: invalid cacheKey");
       return;
@@ -234,7 +250,7 @@ public class HotKeyCache {
     runAfterCommit(() -> {
       redisWriter.run();
       long version = nextVersion(cacheKey);
-      caffeineCache.put(cacheKey, new VersionedValue(value, version));
+      caffeineCache.put(cacheKey, new CacheEntry(value, version, expireAt(ttlMs)));
       broadcastPublisher.ifPresentOrElse(
         p -> p.broadcastHotKeyWithVersion(cacheKey, version),
         () -> log.debug("No broadcast publisher found, please enable Broadcast")
@@ -275,8 +291,12 @@ public class HotKeyCache {
     task.run();
   }
 
-  @SuppressWarnings("unchecked")
   private <T> Optional<T> loadSingleflight(String cacheKey, Supplier<T> redisReader) {
+    return loadSingleflight(cacheKey, redisReader, Long.MAX_VALUE);
+  }
+
+  @SuppressWarnings("unchecked")
+  private <T> Optional<T> loadSingleflight(String cacheKey, Supplier<T> redisReader, long ttlMs) {
     CompletableFuture<Object> loadFuture = inflightLoads
       .asMap()
       .computeIfAbsent(cacheKey, key ->
@@ -293,11 +313,10 @@ public class HotKeyCache {
     try {
       return Optional.ofNullable((T) loadFuture.join()).map(value -> {
         if (hotKeyDetector.add(cacheKey, 1).isHotKey()) {
-          caffeineCache.put(cacheKey, new VersionedValue(value, 0L));
+          caffeineCache.put(cacheKey, new CacheEntry(value, 0L, expireAt(ttlMs)));
           if (softExpireAt != null) {
             softExpireAt.put(cacheKey, System.currentTimeMillis() + softTtlMs);
           }
-          // Broadcast requires the Broadcast module to be enabled
           broadcastPublisher.ifPresent(p -> p.broadcastHotKey(cacheKey));
           log.debug("HotKey detected and loaded into local caffeine cache: {}", cacheKey);
         }
@@ -309,7 +328,7 @@ public class HotKeyCache {
     }
   }
 
-  private <T> void triggerAsyncRefresh(String cacheKey, Supplier<T> redisReader) {
+  private <T> void triggerAsyncRefresh(String cacheKey, Supplier<T> redisReader, long softTtlMs) {
     if (!refreshLimiter.tryAcquire()) {
       log.debug("Refresh limiter blocked, skip async refresh: {}", cacheKey);
       return;
@@ -322,7 +341,9 @@ public class HotKeyCache {
           return;
         }
         if (value != null) {
-          caffeineCache.put(cacheKey, new VersionedValue(value, 0L));
+          Object existing = caffeineCache.getIfPresent(cacheKey);
+          long keepExpireAt = (existing instanceof CacheEntry ce) ? ce.getExpireAtMs() : Long.MAX_VALUE;
+          caffeineCache.put(cacheKey, new CacheEntry(value, 0L, keepExpireAt));
           softExpireAt.put(cacheKey, System.currentTimeMillis() + softTtlMs);
         }
       } finally {
