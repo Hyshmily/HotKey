@@ -55,7 +55,7 @@ It uses [HeavyKeeper](https://github.com/go-kratos/aegis) (a Count-Min Sketch va
 │              │ ←──────────────────── │  (local)     │
 └──────┬───────┘   Optional.of(value)  └──────┬───────┘
        │ L1 miss           (auto unwrap       │ isHotKey()?
-       ↓ (inflight dedup)  VersionedValue)    ↓
+       ↓ (inflight dedup)  CacheEntry)       ↓
 ┌──────────────┐   redisReader     ┌───────────────┐
 │  L2 Storage  │ ←───────────────  │     TopK      │
 │  (pluggable) │ ───────────────→  │  (interface)  │
@@ -69,7 +69,7 @@ Optional   Optional.empty()        │ total()       │
                                            │ isHotKey()
                                            ↓
                               Caffeine.put(key,
-                                VersionedValue(value, version=0L))
+                                CacheEntry(value, version=0L, expireAtMs))
                               + broadcastHotKey with version header
 ```
 
@@ -77,7 +77,7 @@ Write path (user-initiated):
 `putThrough(cacheKey, value, writer)`
 ├─ `writer.run()` — L2 write (caller-supplied Runnable)
 ├─ `nextVersion(cacheKey)` — Redis INCR → monotonic version
-├─ Caffeine.put(cacheKey, VersionedValue(value, version))
+├─ Caffeine.put(cacheKey, CacheEntry(value, version, expireAtMs))
 └─ RabbitMQ fanout with version header (if enabled)
 
 For incremental collection mutations (LPUSH, SADD, ZADD):
@@ -106,7 +106,7 @@ Soft Expire Read Path (`getWithSoftExpire`):
                  ↓
             loadSingleflight(cacheKey, redisReader)
             (see Normal Read Path above)
-            Caffeine.put(key, VersionedValue(value, 0L))
+            Caffeine.put(key, CacheEntry(value, 0L, keepExpireAt))
 ```
 
 ## Degradation
