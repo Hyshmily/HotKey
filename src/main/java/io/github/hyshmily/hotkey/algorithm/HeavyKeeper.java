@@ -142,6 +142,13 @@ public class HeavyKeeper implements TopK {
   }
 
   @Override
+  public boolean contains(String key) {
+    synchronized (sortedTopK) {
+      return heapIndex.containsKey(key);
+    }
+  }
+
+  @Override
   public BlockingQueue<Item> expelled() {
     return expelledQueue;
   }
