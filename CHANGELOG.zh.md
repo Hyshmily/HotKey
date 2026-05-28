@@ -4,6 +4,10 @@
 
 ## 1.0.8-SNAPSHOT
 
+- **HotKey Bean 竞态条件修复** — `HotKeyRedisAutoConfiguration` 新增 `@AutoConfiguration(after = {HotKeyAutoConfiguration.class, RedisAutoConfiguration.class})` 和 `hotKey()` bean，确保 Redis 在 classpath 时 `HotKey` 无论自动配置顺序都正常创建。
+
+## 1.0.8
+
 - **Per-entry 硬 TTL** — `get(key, reader, ttlMs)` 和 `putThrough(key, value, writer, ttlMs)` 支持为单个 entry 设置 Caffeine 硬 TTL（毫秒）。未传 ttlMs 的调用仍使用全局 `hotkey.local-cache-ttl-minutes`。
 - **Per-call 软 TTL** — `getWithSoftExpire(key, reader, softTtlMs)` 支持按调用覆盖全局 `hotkey.soft-ttl-ms`。
 - **`VersionedValue` → `CacheEntry`** — 内部缓存条目类型新增 `expireAtMs` 字段，与 `value`、`version` 并列。`VersionedValue` 已删除。
@@ -12,7 +16,6 @@
 - **软过期 TTL 保留** — `triggerAsyncRefresh` 刷新时保留原始 entry 的 `expireAtMs`，不再重置为 `Long.MAX_VALUE`，per-entry 硬 TTL 在后台刷新中保持不变。
 - **移除 `instance-id` YAML 配置** — `BroadcastProperties.instanceId` 无 setter（`@Setter(AccessLevel.NONE)`），YAML 中的 `hotkey.broadcast.instance-id` 实际无效，已从配置示例中移除。
 - **广播 TTL 保留** — `BroadcastListener.handleVersionedHotKey` 现在保留本地 entry 的 `expireAtMs`，不再重置为 `Long.MAX_VALUE`，per-entry 硬 TTL 在广播更新中保持不变。
-- **HotKey Bean 竞态条件修复** — `HotKeyRedisAutoConfiguration` 新增 `@AutoConfiguration(after = {HotKeyAutoConfiguration.class, RedisAutoConfiguration.class})` 和 `hotKey()` bean，确保 Redis 在 classpath 时 `HotKey` 无论自动配置顺序都正常创建。
 - **`HeavyKeeper.contains()` O(1) 覆盖** — 用 `heapIndex.containsKey()` 在 `synchronized(sortedTopK)` 内覆盖 `contains()`，`isHotKey()` 变为真正 O(1)（原先回退到 O(K log K) 的 `list()` 遍历）。
 - **`invalidate()` 补入 API 文档** — 单 key `invalidate(cacheKey)` 现在在 API 参考表中列出。
 - **README 重构** — 删除过时的已知问题 / Workaround 章节；`putInvalidate` → `putBeforeInvalidate` 修正；架构图补 `contains()`；新增 TTL 参考表；重写软失效章节对比传统逻辑过期。

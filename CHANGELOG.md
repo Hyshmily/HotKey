@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## 1.0.8-SNAPSHOT
 
+- **HotKey Bean Race Condition Fix** — `HotKeyRedisAutoConfiguration` now has `@AutoConfiguration(after = {HotKeyAutoConfiguration.class, RedisAutoConfiguration.class})` and its own `hotKey()` bean, ensuring `HotKey` is always created when Redis is on classpath regardless of auto-config ordering.
+
+## 1.0.8
+
 - **Per-Entry Hard TTL** — `get(key, reader, ttlMs)` and `putThrough(key, value, writer, ttlMs)` allow setting a per-entry Caffeine hard TTL (milliseconds). Entries without a custom TTL remain governed by the global `hotkey.local-cache-ttl-minutes`.
 - **Per-Call Soft TTL** — `getWithSoftExpire(key, reader, softTtlMs)` allows overriding the global `hotkey.soft-ttl-ms` on a per-call basis.
 - **`VersionedValue` → `CacheEntry`** — internal cache entry type now carries `expireAtMs` alongside `value` and `version`. `VersionedValue` removed.
@@ -12,7 +16,6 @@ All notable changes to this project will be documented in this file.
 - **Soft Expire TTL Preservation** — `triggerAsyncRefresh` now preserves the original entry's `expireAtMs` instead of resetting to `Long.MAX_VALUE`, keeping per-entry hard TTL intact across background refreshes.
 - **`instance-id` Removed from YAML** — `BroadcastProperties.instanceId` has no setter (`@Setter(AccessLevel.NONE)`); the YAML property `hotkey.broadcast.instance-id` was non-functional and has been removed from config examples.
 - **Broadcast TTL Preservation** — `BroadcastListener.handleVersionedHotKey` now preserves the local entry's `expireAtMs` instead of resetting to `Long.MAX_VALUE`, keeping per-entry hard TTL intact across broadcast updates.
-- **HotKey Bean Race Condition Fix** — `HotKeyRedisAutoConfiguration` now has `@AutoConfiguration(after = {HotKeyAutoConfiguration.class, RedisAutoConfiguration.class})` and its own `hotKey()` bean, ensuring `HotKey` is always created when Redis is on classpath regardless of auto-config ordering.
 - **`HeavyKeeper.contains()` O(1) Override** — overrode `contains()` with `heapIndex.containsKey()` inside `synchronized(sortedTopK)`, providing guaranteed O(1) `isHotKey()` lookups (previously fell through to O(K log K) default `list()` iteration).
 - **`invalidate()` Added to API Docs** — single-key `invalidate(cacheKey)` now documented in the API reference table.
 - **README Overhaul** — removed outdated known issue / workaround section; fixed `putInvalidate` → `putBeforeInvalidate` references; added `contains()` to architecture diagram; added TTL Reference table; rewrote soft expire section with comparison to traditional logical expiration.
