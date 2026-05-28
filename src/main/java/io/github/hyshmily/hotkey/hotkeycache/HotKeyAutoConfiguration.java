@@ -13,13 +13,12 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
-import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 @Slf4j
@@ -31,11 +30,12 @@ public class HotKeyAutoConfiguration {
   @ConditionalOnMissingBean
   public TopK hotKeyDetector(HotKeyProperties properties) {
     return new HeavyKeeper(
-        properties.getTopK(),
-        properties.getWidth(),
-        properties.getDepth(),
-        properties.getDecay(),
-        properties.getMinCount());
+      properties.getTopK(),
+      properties.getWidth(),
+      properties.getDepth(),
+      properties.getDecay(),
+      properties.getMinCount()
+    );
   }
 
   @Bean
@@ -43,8 +43,9 @@ public class HotKeyAutoConfiguration {
   public Cache<String, Object> hotLocalCache(HotKeyProperties properties) {
     long defaultTtlNanos = TimeUnit.MINUTES.toNanos(properties.getLocalCacheTtlMinutes());
     Caffeine<Object, Object> builder = Caffeine.newBuilder()
-        .maximumSize(properties.getLocalCacheMaxSize())
-        .expireAfter(new Expiry<Object, Object>() {
+      .maximumSize(properties.getLocalCacheMaxSize())
+      .expireAfter(
+        new Expiry<Object, Object>() {
           @Override
           public long expireAfterCreate(Object key, Object value, long currentTimeNanos) {
             if (value instanceof CacheEntry entry) {
@@ -66,7 +67,8 @@ public class HotKeyAutoConfiguration {
           public long expireAfterRead(Object key, Object value, long currentTimeNanos, long currentDuration) {
             return currentDuration;
           }
-        });
+        }
+      );
     if (properties.getLocalCacheAccessTtlMinutes() > 0) {
       builder.expireAfterAccess(properties.getLocalCacheAccessTtlMinutes(), TimeUnit.MINUTES);
     }
@@ -77,9 +79,9 @@ public class HotKeyAutoConfiguration {
   @ConditionalOnMissingBean
   public Cache<String, CompletableFuture<Object>> inflightLoads(HotKeyProperties properties) {
     return Caffeine.newBuilder()
-        .maximumSize(properties.getInflightMaxSize())
-        .expireAfterWrite(properties.getInflightTtlSeconds(), TimeUnit.SECONDS)
-        .build();
+      .maximumSize(properties.getInflightMaxSize())
+      .expireAfterWrite(properties.getInflightTtlSeconds(), TimeUnit.SECONDS)
+      .build();
   }
 
   @Bean("hotKeyExecutor")
@@ -91,8 +93,12 @@ public class HotKeyAutoConfiguration {
     executor.setQueueCapacity(properties.getExecutorQueueCapacity());
     executor.setThreadNamePrefix("hotkey-");
     executor.setRejectedExecutionHandler((r, e) -> {
-      log.warn("HotKey executor task rejected: corePool={}, maxPool={}, queueCapacity={}",
-        properties.getExecutorCorePoolSize(), properties.getExecutorMaxPoolSize(), properties.getExecutorQueueCapacity());
+      log.warn(
+        "HotKey executor task rejected: corePool={}, maxPool={}, queueCapacity={}",
+        properties.getExecutorCorePoolSize(),
+        properties.getExecutorMaxPoolSize(),
+        properties.getExecutorQueueCapacity()
+      );
       throw new RejectedExecutionException("HotKey executor queue full");
     });
     executor.initialize();
@@ -109,21 +115,26 @@ public class HotKeyAutoConfiguration {
   @Bean
   @ConditionalOnMissingBean(type = "org.springframework.data.redis.core.RedisTemplate")
   public HotKeyCache hotKeyCache(
-      TopK hotKeyDetector,
-      Cache<String, Object> hotLocalCache,
-      Cache<String, CompletableFuture<Object>> inflightLoads,
-      Optional<io.github.hyshmily.hotkey.broadcast.BroadcastPublisher> broadcastPublisher,
-      @Qualifier("hotKeyExecutor") Executor hotKeyExecutor,
-      HotKeyProperties properties) {
+    TopK hotKeyDetector,
+    Cache<String, Object> hotLocalCache,
+    Cache<String, CompletableFuture<Object>> inflightLoads,
+    Optional<io.github.hyshmily.hotkey.broadcast.BroadcastPublisher> broadcastPublisher,
+    @Qualifier("hotKeyExecutor") Executor hotKeyExecutor,
+    HotKeyProperties properties
+  ) {
     return new HotKeyCache(
-        hotKeyDetector, hotLocalCache, inflightLoads, broadcastPublisher, hotKeyExecutor,
-        Optional.empty(),
-        properties.getInflightTimeoutSeconds(),
-        properties.getSoftTtlMs(),
-        properties.getRefreshConcurrency(),
-        properties.getSoftExpireMaxSize(),
-        properties.getSoftExpireTtlMinutes(),
-        properties.getVersionKeyTtlMinutes());
+      hotKeyDetector,
+      hotLocalCache,
+      inflightLoads,
+      broadcastPublisher,
+      hotKeyExecutor,
+      Optional.empty(),
+      properties.getInflightTimeoutSeconds(),
+      properties.getSoftTtlMs(),
+      properties.getRefreshConcurrency(),
+      properties.getSoftExpireMaxSize(),
+      properties.getSoftExpireTtlMinutes(),
+      properties.getVersionKeyTtlMinutes()
+    );
   }
-
 }
