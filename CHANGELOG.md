@@ -10,9 +10,11 @@ All notable changes to this project will be documented in this file.
 - **`SingleFlight` Extraction** — singleflight dedup logic extracted from `HotKeyCache` into standalone `SingleFlight` class.
 - **`SoftExpireManager` Extraction** — soft-expire tracking and async refresh extracted from `HotKeyCache` into standalone `SoftExpireManager` class.
 - **`TransactionSupport` Utility** — transaction deferral logic extracted into `TransactionSupport.runAfterCommit()` and `runNowOrAfterCommit()`.
-- **`CacheKeysPolicy` Utility** — `invalidCacheKey()` / `invalidTypeKey()` extracted from `HotKeyCache` into `CacheKeysPolicy`.
+- **`Cach## 1.0.8-RC1cy` Utility** — `invalidCacheKey()` / `invalidTypeKey()` extracted from `HotKeyCache` into `CacheKeysPolicy`.
 - **`loadSingleflight` softTtlMs Fix** — L1 miss path in `getWithSoftExpire` now correctly passes per-call `softTtlMs` to singleflight load, instead of always using the global default.
 - **TTL Reference Table Fix** — corrected `putThrough(key, value, writer)` default from "falls back to `local-cache-ttl-minutes`" to `Long.MAX_VALUE` (no hard TTL override).
+
+## 1.0.8-SNAPSHOT
 
 - **HotKey Bean Race Condition Fix** — `HotKeyRedisAutoConfiguration` now has `@AutoConfiguration(after = {HotKeyAutoConfiguration.class, RedisAutoConfiguration.class})` and its own `hotKey()` bean, ensuring `HotKey` is always created when Redis is on classpath regardless of auto-config ordering.
 - **Combined Hard + Soft TTL** — new `getWithSoftExpire(key, reader, hardTtlMs, softTtlMs)` and `putThrough(key, value, writer, hardTtlMs, softTtlMs)` allow setting both Caffeine hard TTL and soft-expire TTL in a single call.

@@ -336,6 +336,8 @@ User user = hotKey
   });
 ```
 
+> **注意：** per-call 的 `softTtlMs` 仅对本次调用生效。下次调用 `getWithSoftExpire(key, reader)` 不传 `softTtlMs` 时，回退到全局 `hotkey.soft-ttl-ms`。
+
 配置示例：
 
 ```yaml
@@ -360,7 +362,9 @@ hotKey.putThrough("weather:" + city, weatherData,
     TimeUnit.SECONDS.toMillis(30));
 ```
 
-> **注意：** 与 `getWithSoftExpire` 配合使用时，per-entry 硬 TTL 在后台刷新中会被保留。如果 key 加载时设置了自定义 `ttlMs`，后续软过期刷新会保持原始硬过期时间，不会重置为全局默认值。
+> **per-call TTL 语义说明：**
+> - per-call 的 `hardTtlMs` 仅对本次 Caffeine put 生效。下次调用 `get(key, reader)` 不传 `hardTtlMs` 时，回退到全局 `hotkey.local-cache-ttl-minutes`。一旦 Caffeine 物理淘汰，下次加载按新调用指定的 TTL 为准。
+> - 与 `getWithSoftExpire` 配合使用时，per-entry 硬 TTL 在后台刷新中会被保留。如果 key 加载时设置了自定义 `ttlMs`，后续软过期刷新会保持原始硬过期时间，不会重置为全局默认值。
 
 ## HotKey 门面 API 参考
 
@@ -403,6 +407,8 @@ hotKey.putThrough("weather:" + city, weatherData,
 | 全局 `hotkey.local-cache-ttl-minutes`                  | 所有 entry 的默认硬 TTL（当未传 per-call TTL 时）                       | `5` 分钟                           |
 | 全局 `hotkey.soft-ttl-ms`                              | 未传 per-call 值时的默认软 TTL                                          | `0`（禁用）                        |
 | 全局 `hotkey.local-cache-access-ttl-minutes`           | 基于访问的硬 TTL（每次读取重置），作为 `local-cache-ttl-minutes` 的补充 | `0`（禁用）                        |
+
+> **每次调用语义：** 所有 per-call 的 TTL 覆盖（硬 TTL 和软 TTL）均为一次性——下次不传参数则回退到对应的全局默认值。唯一的例外是软过期后台刷新会保留原始 per-entry 硬 TTL。
 
 ## 广播
 

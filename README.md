@@ -337,6 +337,8 @@ User user = hotKey
   });
 ```
 
+> **Note:** A per-call `softTtlMs` applies to this invocation only. The next call to `getWithSoftExpire(key, reader)` without `softTtlMs` falls back to the global `hotkey.soft-ttl-ms`.
+
 Configuration:
 
 ```yaml
@@ -361,7 +363,9 @@ hotKey.putThrough("weather:" + city, weatherData,
     TimeUnit.SECONDS.toMillis(30));
 ```
 
-> **Note:** When combined with `getWithSoftExpire`, the per-entry hard TTL is preserved across background refreshes. If a key was loaded with a custom `ttlMs`, subsequent soft-expire refreshes will keep the original hard expiry time rather than resetting to the global default.
+> **Notes on per-call TTL semantics:**
+> - A per-call `hardTtlMs` applies to this invocation only. The next call to `get(key, reader)` without `hardTtlMs` falls back to the global `hotkey.local-cache-ttl-minutes`. Once Caffeine physically evicts the entry, the next load uses whatever TTL the new call specifies.
+> - When combined with `getWithSoftExpire`, the per-entry hard TTL is preserved across background refreshes. If a key was loaded with a custom `ttlMs`, subsequent soft-expire refreshes will keep the original hard expiry time rather than resetting to the global default.
 
 ## HotKey API Reference
 
@@ -404,6 +408,8 @@ The recommended entry point is the `HotKey` facade (auto-configured as a Spring 
 | Global `hotkey.local-cache-ttl-minutes`                | Default hard TTL for all entries without per-call TTL                               | `5` minutes                                    |
 | Global `hotkey.soft-ttl-ms`                            | Default soft TTL when no per-call value given                                       | `0` (disabled)                                 |
 | Global `hotkey.local-cache-access-ttl-minutes`         | Access-based hard TTL (resets on every read), supplements `local-cache-ttl-minutes` | `0` (disabled)                                 |
+
+> **Per-call semantics:** All per-call TTL overrides (hard and soft) are one-time only — the next call without the parameter falls back to the corresponding global default. The sole exception is soft-expire async refreshes, which preserve the original per-entry hard TTL.
 
 ## Broadcast
 
