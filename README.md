@@ -102,7 +102,7 @@ Write path failure behavior:
 | `putThrough`                                        | Executor queue full (outside tx) | `RejectedExecutionException` propagates to caller                            |
 | `putThrough`                                        | `writer.run()` / Redis fails     | Error logged on `hotKeyExecutor`, L1 version not updated, no broadcast       |
 | `putBeforeInvalidate`                               | `mutation.run()` throws          | Mutation exception caught and logged; local invalidate and broadcast skipped |
-| `invalidate` / `putBeforeInvalidate` / `putThrough` | `nextVersion()` Redis fails      | Falls back to `System.nanoTime()` (monotonic but non-persistent version)     |
+| `invalidate` / `putBeforeInvalidate` / `putThrough` | `nextVersion()` Redis fails      | Falls back to node-local counter (`nodeId << 32 | counter`, non-persistent version with `degraded=true`) |
 
 Worker mode failure behavior:
 
@@ -409,7 +409,7 @@ hotkey:
 
 Each instance declares its own queue (`hotkey.sync:<instance-id>`) bound to a fanout exchange. Two message types:
 
-- **`TYPE_REFRESH`** — Versioned invalidation. Peers reload the value from Redis via `CacheSyncListener.handleRefresh()`, respecting the version header to skip stale updates. Broadcast carries `isVersionDegraded` header — when the version was generated from degraded source (`System.nanoTime()` fallback), peers accept it even over a non-degraded entry.
+- **`TYPE_REFRESH`** — Versioned invalidation. Peers reload the value from Redis via `CacheSyncListener.handleRefresh()`, respecting the version header to skip stale updates. Broadcast carries `isVersionDegraded` header — when the version was generated from degraded source (node-local counter fallback), peers accept it even over a non-degraded entry.
 - **`TYPE_INVALIDATE`** — Bulk invalidation (`invalidateAll`). Peers immediately remove the key from L1 without reloading.
 
 ### Worker Listener

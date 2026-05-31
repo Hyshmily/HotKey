@@ -102,7 +102,7 @@ hotKey.get(key, supplier)
 | `putThrough`                                        | 线程池队列满（非事务）      | `RejectedExecutionException` 传播到调用方              |
 | `putThrough`                                        | `writer.run()` / Redis 失败 | 错误记录到日志，L1 版本号未更新，不发送广播            |
 | `putBeforeInvalidate`                               | `mutation.run()` 抛出异常   | 捕获突变异常并记录日志；跳过本地失效和广播             |
-| `invalidate` / `putBeforeInvalidate` / `putThrough` | `nextVersion()` Redis 失败  | 回退到 `System.nanoTime()`（单调递增但非持久化版本号） |
+| `invalidate` / `putBeforeInvalidate` / `putThrough` | `nextVersion()` Redis 失败  | 回退到节点本地计数器（`nodeId << 32 | counter`，非持久化，标记 `degraded=true`） |
 
 Worker 模式故障表现：
 
@@ -409,7 +409,7 @@ hotkey:
 
 每个实例声明独立队列（`hotkey.sync:<实例ID>`）绑定到 fanout 交换机。两种消息类型：
 
-- **`TYPE_REFRESH`** — 带版本号的失效。对端通过 `CacheSyncListener.handleRefresh()` 从 Redis 重新加载，根据版本号跳过旧更新。广播携带 `isVersionDegraded` 头部——版本来自降级源（`System.nanoTime()` 回退）时，对端即使已有非降级条目也会接受。
+- **`TYPE_REFRESH`** — 带版本号的失效。对端通过 `CacheSyncListener.handleRefresh()` 从 Redis 重新加载，根据版本号跳过旧更新。广播携带 `isVersionDegraded` 头部——版本来自降级源（节点本地计数器回退）时，对端即使已有非降级条目也会接受。
 - **`TYPE_INVALIDATE`** — 批量失效（`invalidateAll`）。对端立即从 L1 移除该 key，不重新加载。
 
 ### Worker Listener

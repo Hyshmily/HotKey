@@ -18,6 +18,7 @@ package io.github.hyshmily.hotkey.autoconfigure;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.Expiry;
+import io.github.hyshmily.hotkey.HotKey;
 import io.github.hyshmily.hotkey.algorithm.HeavyKeeper;
 import io.github.hyshmily.hotkey.algorithm.TopK;
 import io.github.hyshmily.hotkey.broadcast.CacheSyncPublisher;
@@ -36,6 +37,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.jspecify.annotations.NonNull;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -204,5 +206,20 @@ public class HotKeyAutoConfiguration {
       properties.getVersionKeyTtlMinutes(),
       hotKeyReporter
     );
+  }
+
+  /**
+   * Fallback {@link HotKey} bean.
+   *
+   * <p>Only active when a {@link HotKeyCache} bean exists but no {@link HotKey}
+   * has been defined yet.  The primary {@link HotKey} creator is
+   * {@link HotKeyFacadeAutoConfiguration} — this fallback covers the case where
+   * that auto-configuration is excluded or its bean is overridden.
+   */
+  @Bean
+  @ConditionalOnBean(HotKeyCache.class)
+  @ConditionalOnMissingBean
+  public HotKey hotKey(HotKeyCache hotKeyCache, @Qualifier("hotKeyDetector") TopK hotKeyDetector) {
+    return new HotKey(hotKeyCache, hotKeyDetector);
   }
 }

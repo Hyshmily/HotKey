@@ -53,7 +53,7 @@ putThrough(cacheKey, value, writer)
 ├─ (deferred to afterCommit if inside a Spring transaction)
 ├─ writer.run() — L2 write (caller-supplied Runnable)
 ├─ nextVersion(cacheKey) — Redis INCR → VersionResult(version, isVersionDegraded)
-│  └─ On Redis failure → System.nanoTime() fallback (degraded=true)
+│  └─ On Redis failure → node-local counter fallback (degraded=true)
 ├─ Caffeine.put(cacheKey, CacheEntry(
 │    value, version, isVersionDegraded,
 │    hardTtlMs, hardExpireAtMs,

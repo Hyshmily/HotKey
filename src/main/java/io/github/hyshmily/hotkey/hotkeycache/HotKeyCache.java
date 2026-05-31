@@ -28,6 +28,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -55,6 +56,19 @@ public class HotKeyCache {
   private final Optional<StringRedisTemplate> redisTemplate;
   private final int versionKeyTtlMinutes;
   private final Optional<HotKeyReporter> hotKeyReporter;
+
+  /**
+   * JVM-local node identifier used in fallback version encoding to prevent
+   * cross-JVM ordering conflicts when Redis is unavailable.
+   */
+  private final int nodeId = InstanceIdGenerator.getNodeId();
+
+  /**
+   * Monotonically increasing counter for fallback versions.
+   * Only used when {@link #redisTemplate} is empty or Redis INCR fails.
+   */
+  private final AtomicLong fallbackVersionCounter = new AtomicLong(0);
+
   private static final String NO_SYNC_PUBLISHER = HotKeyConstants.NO_SYNC_PUBLISHER;
 
   /**
@@ -395,10 +409,21 @@ public class HotKeyCache {
           );
           return new VersionResult(v, false);
         } catch (Exception e) {
-          log.warn("Redis version increment failed, fallback to nanoTime: {}", cacheKey, e);
-          return new VersionResult(System.nanoTime(), true);
+          log.warn("Redis version increment failed, fallback to local counter: {}", cacheKey, e);
+          return fallbackVersion();
         }
       })
-      .orElse(new VersionResult(System.nanoTime(), true));
+      .orElse(fallbackVersion());
+  }
+
+  /**
+   * Build a degraded version from a JVM-local node ID and a monotonically
+   * increasing counter.  {@code nodeId} occupies the upper 32 bits so that
+   * degraded versions from different JVMs never collide in the
+   * degraded-vs-degraded comparison.
+   */
+  private VersionResult fallbackVersion() {
+    long version = ((long) nodeId << 32) | (fallbackVersionCounter.incrementAndGet() & 0xFFFFFFFFL);
+    return new VersionResult(version, true);
   }
 }

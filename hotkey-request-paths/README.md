@@ -115,9 +115,9 @@ caller
   │    ├─ YES → EVAL script: INCR hotkey:ver:{key}
   │    │        EXPIRE hotkey:ver:{key} versionKeyTtlMinutes*60
   │    │        success → VersionResult(v, false)
-  │    │        catch   → VersionResult(System.nanoTime(), true)  // degraded=true
+   │    │        catch   → VersionResult(nodeId<<32|counter, true)  // degraded=true
   │    │
-  │    └─ NO  → VersionResult(System.nanoTime(), true)  // degraded=true
+   │    └─ NO  → VersionResult(nodeId<<32|counter, true)  // degraded=true
 ```
 
 ## 3. Invalidate Path

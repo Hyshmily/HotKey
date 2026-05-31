@@ -53,7 +53,7 @@ putThrough(cacheKey, value, writer)
 ├─ （如果在 Spring 事务内，延迟到 afterCommit）
 ├─ writer.run() — L2 写入（调用方提供的 Runnable）
 ├─ nextVersion(cacheKey) — Redis INCR → VersionResult(version, isVersionDegraded)
-│  └─ Redis 失败时 → System.nanoTime() 回退（degraded=true）
+│  └─ Redis 失败时 → 节点本地计数器回退（degraded=true）
 ├─ Caffeine.put(cacheKey, CacheEntry(
 │    value, version, isVersionDegraded,
 │    hardTtlMs, hardExpireAtMs,

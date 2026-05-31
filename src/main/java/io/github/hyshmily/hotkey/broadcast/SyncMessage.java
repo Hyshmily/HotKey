@@ -32,7 +32,7 @@ import org.springframework.amqp.core.Message;
  * @param cacheKey         the affected cache key
  * @param type             the operation type ({@link #TYPE_INVALIDATE} or {@link #TYPE_REFRESH})
  * @param version          the version number at which the operation occurred
- * @param isVersionDegraded whether the version was obtained in degraded mode ({@code System.nanoTime} fallback)
+ * @param isVersionDegraded whether the version was obtained in degraded mode (node-local counter fallback)
  */
 public record SyncMessage(String cacheKey, String type, long version, boolean isVersionDegraded) {
   public static final String TYPE_INVALIDATE = "INVALIDATE";

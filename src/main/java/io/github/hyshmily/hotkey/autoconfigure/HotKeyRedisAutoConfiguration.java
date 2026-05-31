@@ -16,6 +16,7 @@
 package io.github.hyshmily.hotkey.autoconfigure;
 
 import com.github.benmanes.caffeine.cache.Cache;
+import io.github.hyshmily.hotkey.HotKey;
 import io.github.hyshmily.hotkey.algorithm.TopK;
 import io.github.hyshmily.hotkey.broadcast.CacheSyncPublisher;
 import io.github.hyshmily.hotkey.hotkeycache.HotKeyCache;
@@ -25,6 +26,7 @@ import io.github.hyshmily.hotkey.hotkeycache.SingleFlight;
 import io.github.hyshmily.hotkey.hotkeycache.CacheExpireManager;
 import java.util.Optional;
 import java.util.concurrent.Executor;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
@@ -33,14 +35,19 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
 import org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 /**
  * Redis-enhanced auto-configuration that overrides the default
  * {@link HotKeyCache} with one that supports version-based stale detection.
  *
- * <p>Activates when {@code RedisTemplate} is on the classpath and a
- * {@link StringRedisTemplate} bean is available.  Runs <em>after</em>
+ * <p>Activates when a {@link RedisTemplate} bean is available.
+ * {@link StringRedisTemplate} is injected as optional — if absent,
+ * version tracking falls back to a node-local counter ({@link
+ * io.github.hyshmily.hotkey.hotkeycache.InstanceIdGenerator#getNodeId()} + {@link
+ * java.util.concurrent.atomic.AtomicLong}).
+ * Runs <em>after</em>
  * {@link HotKeyAutoConfiguration} so its {@code @ConditionalOnMissingBean}
  * on {@code hotKeyCache} wins over the non-Redis variant, and after
  * {@link RedisAutoConfiguration} so the Redis infrastructure is ready.
@@ -50,13 +57,14 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 @EnableConfigurationProperties(HotKeyProperties.class)
 public class HotKeyRedisAutoConfiguration {
 
-  /**
-   * Create the Redis-enhanced {@link HotKeyCache} with version-based stale detection.
-   * Only active when a {@link StringRedisTemplate} bean is available.
-   */
+   /**
+    * Create the Redis-enhanced {@link HotKeyCache} with version-based stale detection.
+    * {@link StringRedisTemplate} is optional — if absent, version tracking falls back
+    * to a node-local counter ({@code nodeId << 32 | counter}).
+    */
   @Bean
   @ConditionalOnMissingBean
-  @ConditionalOnBean(StringRedisTemplate.class)
+  @ConditionalOnBean(RedisTemplate.class)
   public HotKeyCache hotKeyCache(
     @Qualifier("hotKeyDetector") TopK hotKeyDetector,
     Cache<String, Object> hotLocalCache,
@@ -65,7 +73,7 @@ public class HotKeyRedisAutoConfiguration {
     Optional<CacheSyncPublisher> syncPublisher,
     Optional<HotKeyReporter> hotKeyReporter,
     @Qualifier("hotKeyExecutor") Executor hotKeyExecutor,
-    StringRedisTemplate redisTemplate,
+    ObjectProvider<StringRedisTemplate> redisTemplateProvider,
     HotKeyProperties properties
   ) {
     return new HotKeyCache(
@@ -75,10 +83,24 @@ public class HotKeyRedisAutoConfiguration {
       expireManager,
       hotKeyExecutor,
       syncPublisher,
-      Optional.of(redisTemplate),
+      Optional.ofNullable(redisTemplateProvider.getIfAvailable()),
       properties.getVersionKeyTtlMinutes(),
       hotKeyReporter
     );
   }
 
+  /**
+   * Fallback {@link HotKey} bean for the Redis-enhanced path.
+   *
+   * <p>Only active when a {@link HotKeyCache} bean exists but no {@link HotKey}
+   * has been defined yet.  This covers the case where the primary
+   * {@link HotKeyFacadeAutoConfiguration} is excluded and the {@link HotKeyCache}
+   * originates from this configuration.
+   */
+  @Bean
+  @ConditionalOnBean(HotKeyCache.class)
+  @ConditionalOnMissingBean
+  public HotKey hotKey(HotKeyCache hotKeyCache, @Qualifier("hotKeyDetector") TopK hotKeyDetector) {
+    return new HotKey(hotKeyCache, hotKeyDetector);
+  }
 }

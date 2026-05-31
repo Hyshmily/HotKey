@@ -23,7 +23,7 @@ import lombok.Getter;
  * and hot-key state.
  *
  * <p>{@code isVersionDegraded} indicates whether the version was obtained
- * from Redis INCR (normal) or fell back to {@link System#nanoTime}
+ * from Redis INCR (normal) or fell back to node-local counter ({@code nodeId << 32 | counter})
  * (degraded) — see {@code VersionResult} for the degraded-detection logic
  * used during broadcast reception.
  * <p>The normal-state TTLs recorded at entry creation are preserved across state
