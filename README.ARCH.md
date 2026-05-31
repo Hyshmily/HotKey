@@ -12,17 +12,17 @@
        │ L1 miss          (auto unwrap         │ isHotKey()?
        ↓ (inflight dedup) CacheEntry)          ↓
 ┌──────────────┐  ──── reader ────→  ┌───────────────┐
-│  L2 Storage  │  ──add(key,1)───→  │     TopK      │
-│  (pluggable) │                    │  (interface)  │
-└──┬───────┬───┘                    ├───────────────┤
+│  L2 Storage  │  ──add(key,1)───→   │     TopK      │
+│  (pluggable) │                     │  (interface)  │
+└──┬───────┬───┘                     ├───────────────┤
     │ hit   │ null                   │ add()→Result  │
     ↓       ↓                        │ list()        │
  Optional   Optional.empty()         │ listTopN(n)   │
  .of(value)   r.isEmpty() → DB       │ total()       │
-                                      │ contains()    │
-                                      │ expelled()    │
-                                      │ fading()      │
-                                      └───────┬───────┘
+                                     │ contains()    │
+                                     │ expelled()    │
+                                     │ fading()      │
+                                     └───────┬───────┘
                                              │ isHotKey()?
                                              ↓
                                   ┌─────────────────────┐
@@ -113,8 +113,8 @@ invalidateAll(cacheKeys)
             Return stale          triggerAsyncRefresh
             value +                ├─ refreshLimiter.tryAcquire()
             check TopK             │  (Semaphore, max concurrency)
-                                    │  └─ On busy → skip (retry next get)
-                                    └─ Async (hotKeyExecutor):
+                                   │  └─ On busy → skip (retry next get)
+                                   └─ Async (hotKeyExecutor):
                                          L2 read → Caffeine.put
                                          + update softExpireAt
                                          + preserve hardTtlMs
@@ -139,8 +139,8 @@ When `hotkey.sync.enabled=true`, all write operations (`putThrough`, `putBeforeI
 ```
 ┌──────────────┐    putThrough / invalidate     ┌───────────────────┐
 │  Instance A  │ ──── CacheSyncPublisher ─────→ │ hotkey.sync       │
-│  (writer)    │                                 │  (fanout exchange)│
-└──────────────┘                                 └────────┬──────────┘
+│  (writer)    │                                │  (fanout exchange)│
+└──────────────┘                                └────────┬──────────┘
                                                           │
                                           ┌─────────────┼─────────────┐
                                           ↓             ↓             ↓
@@ -164,11 +164,11 @@ When `hotkey.sync.enabled=true`, all write operations (`putThrough`, `putBeforeI
 
 **Version comparison (4-case):**
 
-| Local version | Incoming version | Result |
-|---------------|------------------|--------|
+| Local version | Incoming version | Result                        |
+| ------------- | ---------------- | ----------------------------- |
 | Normal        | Normal           | Higher wins (numeric compare) |
-| Normal        | Degraded         | Local wins (skip update) |
-| Degraded      | Normal           | Incoming wins (overwrite) |
+| Normal        | Degraded         | Local wins (skip update)      |
+| Degraded      | Normal           | Incoming wins (overwrite)     |
 | Degraded      | Degraded         | Higher wins (numeric compare) |
 
 ### Report & Worker Architecture
@@ -181,23 +181,23 @@ For cluster-wide hot key detection, app instances periodically report access cou
 │                      │              │                              │
 │  HotKeyReporter      │  periodic    │  ReportConsumer              │
 │  (batches TopK data  │ ──────────→  │  (receives reports via       │
-│   every 100ms)       │  RabbitMQ   │   hotkey.report.exchange)    │
+│   every 100ms)       │  RabbitMQ   │   hotkey.report.exchange)     │
 │                      │              │         │                    │
 │  ReportPublisher     │              │         ↓                    │
 │  (sends to           │              │  SlidingWindowDetector       │
-│   hotkey.report.     │              │  (lock-free time-series     │
-│   exchange)          │              │   counter per key)          │
+│   hotkey.report.     │              │  (lock-free time-series      │
+│   exchange)          │              │   counter per key)           │
 └──────────────────────┘              │         │                    │
                                       │         ↓                    │
                                       │  HotKeyStateMachine          │
                                       │  (per-key FSM:               │
-                                      │   NORMAL→HOT→PRE_COOL→COOL  │
-                                      │   →NORMAL)                  │
+                                      │   NORMAL→HOT→PRE_COOL→COOL   │
+                                      │   →NORMAL)                   │
                                       │         │                    │
                                       │         ↓                    │
                                       │  WorkerBroadcaster           │
                                       │  (HOT/COOL decisions via     │
-                                      │   hotkey.worker.exchange) │
+                                      │   hotkey.worker.exchange)    │
                                       │         │                    │
                                       └─────────┼────────────────────┘
                                                 │ RabbitMQ fanout

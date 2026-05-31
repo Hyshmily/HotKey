@@ -484,9 +484,3 @@ See [README.CONFIG.md](README.CONFIG.md) for full configuration reference (also 
 ## License
 
 Apache License 2.0
-
-## 1.1.0
-
-- **CacheEntry Constructor Parameter Fix** — corrected swapped hardExpireAtMs and softTtlMs arguments in HotKeyCache.loadAndCache() (HOT and NORMAL paths) and putThrough(), which caused Caffeine entries to expire immediately. All constructor call sites now match the canonical field order.
-- **COOL State Soft-Expire Disabled** — `WorkerListener.handleCool()` now sets `softTtlMs=0, softExpireAtMs=0` for COOL entries, preventing stale background refreshes on downgraded keys.
-- **COOL Entries Eligible for Soft-Expire** — `HotKeyCache.getWithSoftExpire()` guard widened from `HOT` only to `HOT || COOL`, so COOL entries still benefit from stale-while-revalidate (via `getWithSoftExpire`).
