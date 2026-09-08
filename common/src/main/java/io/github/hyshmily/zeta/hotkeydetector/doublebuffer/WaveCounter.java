@@ -48,43 +48,45 @@ import org.springframework.beans.factory.InitializingBean;
  *
  * <h3>Design rationale</h3>
  *
- * <p><b>Problem.</b> N writer threads increment per-key counters at high
+ * <p>
+ * <b>Problem.</b> N writer threads increment per-key counters at high
  * frequency; a periodic snapshot of distinct-key counts must be delivered
- * to a downstream consumer (a hot-key detector, a cluster reporter).  The
+ * to a downstream consumer (a hot-key detector, a cluster reporter). The
  * workload is skewed — a few keys carry most of the traffic — and the key
- * universe is largely stable across cycles.  The design must budget four
+ * universe is largely stable across cycles. The design must budget four
  * resources: aggregate throughput (multi-million ops/s at 16 threads),
  * memory (bounded, flat under churn), delivery latency (bounded), and a
  * precisely documented precision model.
  *
- * <p><b>Core idea — heat-aware routing.</b> A single shared table would
+ * <p>
+ * <b>Core idea — heat-aware routing.</b> A single shared table would
  * serialize every writer on the hot keys; per-writer buffering for every
- * key would multiply memory and delivery work.  WaveCounter routes each
+ * key would multiply memory and delivery work. WaveCounter routes each
  * count into one of two paths, sharing a single {@link ConcurrentHashMap}:
  * <ul>
- *   <li><b>Hot path</b> — each writer merges hot keys into its own private
- *       open-addressing map (zero shared access, no contention); every
- *       {@code opMaxCount} increments the local map is bulk-merged into
- *       the shared table.  Fixed per-op costs: the lock-free fast add (a
- *       pointer-equal last-key cache short-circuit, consulted BEFORE the
- *       routing beacon so a repeated-key op — the common hot pattern —
- *       never pays the beacon read; on a cache miss the beacon test plus a
- *       {@link Ceils#drainStamp} read and a post-check — see the lock
- *       rationale below, ADR-0043) and an atomic per-slot count add
- *       ({@code AtomicLongArray.getAndAdd}, the price of the exact
- *       take-and-merge protocol).  The per-map {@link ReentrantLock} is
- *       paid only when a drain is actually in flight (µs-scale, at most
- *       once per writer per tide).</li>
- *   <li><b>Cold path</b> — a direct lock-free {@code ConcurrentHashMap}
- *       increment with no local layer: the cheapest possible write, at the
- *       cost of a documented approximate snapshot window (see the
- *       Correctness model).</li>
+ * <li><b>Hot path</b> — each writer merges hot keys into its own private
+ * open-addressing map (zero shared access, no contention); every
+ * {@code opMaxCount} increments the local map is bulk-merged into
+ * the shared table. Fixed per-op costs: the lock-free fast add (a
+ * pointer-equal last-key cache short-circuit, consulted BEFORE the
+ * routing beacon so a repeated-key op — the common hot pattern —
+ * never pays the beacon read; on a cache miss the beacon test plus a
+ * {@link Ceils#drainStamp} read and a post-check — see the lock
+ * rationale below, ADR-0043) and an atomic per-slot count add
+ * ({@code AtomicLongArray.getAndAdd}, the price of the exact
+ * take-and-merge protocol). The per-map {@link ReentrantLock} is
+ * paid only when a drain is actually in flight (µs-scale, at most
+ * once per writer per tide).</li>
+ * <li><b>Cold path</b> — a direct lock-free {@code ConcurrentHashMap}
+ * increment with no local layer: the cheapest possible write, at the
+ * cost of a documented approximate snapshot window (see the
+ * Correctness model).</li>
  * </ul>
  * Promotion from cold to hot is a per-cycle decision: every delivery
  * scans the snapshot and promotes the keys that earn the top
  * {@code hotLimit} slots, selected from the cycle's counts (floored at
  * {@link #PROMOTION_FLOOR}); the key takes the
- * exact hot path from the next cycle on.  Membership is time-sampled:
+ * exact hot path from the next cycle on. Membership is time-sampled:
  * the counting beacon decays on every other promoted tide (snapshots below
  * {@link #MIN_PROMOTION_KEYS} distinct keys and empty tides skip the
  * decay sweep entirely — see ADR-0038; the every-other-tide sweep period
@@ -93,185 +95,190 @@ import org.springframework.beans.factory.InitializingBean;
  * drifting heat instead of freezing.
  * Promotion gates only performance, never correctness.
  *
- * <p><b>Precision budget.</b> Exactness is expensive in proportion to
- * the time a writer holds a shared structure.  The design partitions the
+ * <p>
+ * <b>Precision budget.</b> Exactness is expensive in proportion to
+ * the time a writer holds a shared structure. The design partitions the
  * budget by heat: the hot path pays for exactness (in-flight merges are
  * waited out), the cold path pays for throughput (a bounded approximate
- * window of ~1e-5/op).  Sustained hot keys are promoted and then take the
+ * window of ~1e-5/op). Sustained hot keys are promoted and then take the
  * exact path, so the approximation applies only to traffic that does not
  * justify exactness.
  *
- * <p><b>Default parameters.</b> Each default is a measured design
+ * <p>
+ * <b>Default parameters.</b> Each default is a measured design
  * decision, not an operator knob:
  * <ul>
- *   <li><b>opMaxCount = 128</b> (the local batch size) — the knee of a
- *       64/128 sweep at 16 threads: small enough that hot local data
- *       reaches the shared table within one tide interval, large enough
- *       to amortize the shared-table add (~0.3ns/op at 16 threads).</li>
- *   <li><b>Promotion boundary, not a threshold</b> — the top
- *       {@code hotLimit} keys of the cycle earn the hot slots.  A
- *       log2-bucket histogram of the snapshot locates the boundary bucket
- *       (one O(n) pass with a leading-zeros log per key), and the boundary
- *       VALUE is the exact k-th largest count of the cycle, selected
- *       within that bucket by quickselect (ADR-0054) — never a
- *       power-of-two edge.  Scale-free by construction: a relative hot
- *       spot qualifies
- *       at ANY traffic volume (a fixed absolute threshold cannot — a
- *       low-volume cycle's top key measured 0 promotions at 80 counts).
- *       {@link #PROMOTION_FLOOR} (10) keeps noise keys (1-9
- *       counts/cycle) out of the hot set.  A snapshot below
- *       {@link #MIN_PROMOTION_KEYS} (16) distinct keys skips promotion
- *       entirely (Caffeine's min-signal discipline — the decay reclaims
- *       any slots anyway, so this guards against wasted promotion work,
- *       not permanent pollution).  When the exact k-th largest cuts a
- *       tie-band wider than the remaining slots, promotion is incumbent-first:
- *       renewing members are re-promoted before any newcomer (the
- *       pre-decay beacon state — the only last-tide membership memory —
- *       is captured in {@link #incumbentIdx} before the halving decay
- *       zeroes it), so the capacity break never evicts a renewing key and
- *       the hot set stays stable under flat distributions where every
- *       promotion would otherwise be a coin flip.  Both the selection and
- *       the split are
- *       routing-only and cost zero per-op; the deliverer pays the bucket
- *       view pass, the quickselect and the tie/blocked pass on scan tides
- *       (O(bucket) expected) plus the incumbent split on overflowing
- *       tides.  A stable-workload shortcut (ADR-0057) reuses the previous
- *       tide's exact boundary as a sweep filter, so the selection runs
- *       over the ~hotLimit-key list instead of the bucket whenever the
- *       list provably holds the k-th largest — the flat-distribution
- *       worst case (a boundary bucket the size of the snapshot) degrades
- *       to O(hotLimit) selection on stable workloads.</li>
- *   <li><b>hotLimit = 1024</b> — caps the active promoted hot set so
- *       pathological traffic cannot grow it unboundedly.  The routing
- *       beacon is the compact 2+2 role-evidence array of
- *       {@code hotLimit × 32} rooms (≈16 KB at 1024 — no key strings
- *       retained, so cold keys stay GC-eligible), with a ~0.37%
- *       false-positive rate at full capacity — routing-only, never
- *       correctness (a false positive merely routes a cold key onto the
- *       bounded hot path, whose counts converge in the same table).
- *       The beacon is read on EVERY count, so its size has a cache-level
- *       throughput effect — 1024 (16 KB, L1/L2-resident) measured
- *       consistently fastest on a 16-thread sweep; the "capacity starves"
- *       penalty for limits below the hot-key count did not materialize
- *       (the cold path carries un-promoted hot keys without measurable
- *       loss).  Throughput-sensitive deployments may lower it further,
- *       capacity-hungry ones may raise it back.</li>
- *   <li><b>Promotion floor, renew-disambiguated governor</b> — the
- *       absolute floor (10) is the seed of a {@link MoonsTidalForce}
- *       (ADR-0045): the floor never filters above the histogram
- *       boundary.  Healthy tides with keys blocked behind the floor drop
- *       it toward the boundary so the renewing keys qualify; distress
- *       where the occupied hot slots earn less per slot than cold keys
- *       earn per key (the density-ratio evidence) arms a bounded
- *       raise-walk that filters the stale tail; an empty hot set
- *       collapses the floor to the seed.  The raise runs as an
- *       evidence-based, reversible probe (goal verdict, budgeted undo,
- *       retry backoff): an unconditional step would ratchet the floor
- *       past the whole distribution on rotating hot sets and oscillate
- *       forever under key churn.  Veto-return, audit clock and
- *       saturation release are kept as defensive machinery; the
- *       histogram boundary stays scale-free.  Two volume-gated regime
- *       switches extend it (ADR-0045 §III): a quiet regime (vol &lt;
- *       {@link #QUIET_VOLUME}, empty set) drops the floor to
- *       {@link #QUIET_FLOOR} so any key routes hot, and a RAISED floor
- *       blocking the whole incoming distribution at high volume
- *       collapses in one tide (the flood collapse) instead of the
- *       wrong-direction raise-walk plus the slow decay-driven collapse.
- *       The volume EWMA is folded once per non-empty tide by the
- *       deliverer; both switches are wall-clock-debounced.  Three
- *       ADR-0051 refinements bound the probe machine's worst cases:
- *       a raise CONFIRM that lands over-filtering corrects to the
- *       boundary immediately, a confirmed raise shields the re-arm for
- *       {@link #CONFIRM_SHIELD} tides (no alternating-workload
- *       ratchet), and the walk budget binds on both verdict branches.</li>
- *   <li><b>deliverIntervalMs = 500, adaptive</b> — delivery latency is
- *       bounded by one adaptive interval: a tide that delivered ≥ 20,000
- *       distinct keys re-schedules at 50ms, scaling linearly back to the
- *       base as the backlog shrinks — trading burst detection latency
- *       against delivery overhead, self-damping as the reservoir drains.
- *       The ramp is driven by a {@link TidePacer}: the raw backlog is
- *       folded into a smoothed reference with a fast-attack (bursts
- *       shorten the cycle immediately) / slow-release (the fast cadence
- *       drains the reservoir over ~5 tides instead of snapping back)
- *       asymmetry and a still band (in-band jitter moves nothing);
- *       consecutive EMPTY tides stretch the cadence up to 2x the base
- *       (the empty-tide ladder — idle cycles stop paying the quiescence,
- *       decay and wakeup at the base rate), reset by any non-empty tide.</li>
- *   <li><b>SNAPSHOT_QUIESCENCE = 1ms</b> — the price of the cold
- *       approximate window (see the Correctness model).  Paid when the
- *       shared table received any write this cycle: the
- *       {@code coldWriteSeen} flag is set by every insert path — cold
- *       first-inserts and every merge (read-gated, so only the first
- *       mark of a cycle pays) — and captured and cleared at the swap.
- *       Entries inserted by ANY path (including hot-path drains) are
- *       visible to cold hit-writers, whose adds need the same window,
- *       so only a cycle with NO shared-table writes skips the window
- *       entirely — and its old table is empty anyway, nothing to lose.
- *       A cycle with table writes pays the same parked wait.  The wait
- *       parks instead of spinning, so the cost is a yielded core for
- *       most of the window, not CPU burn.</li>
+ * <li><b>opMaxCount = 128</b> (the local batch size) — the knee of a
+ * 64/128 sweep at 16 threads: small enough that hot local data
+ * reaches the shared table within one tide interval, large enough
+ * to amortize the shared-table add (~0.3ns/op at 16 threads).</li>
+ * <li><b>Promotion boundary, not a threshold</b> — the top
+ * {@code hotLimit} keys of the cycle earn the hot slots. A
+ * log2-bucket histogram of the snapshot locates the boundary bucket
+ * (one O(n) pass with a leading-zeros log per key), and the boundary
+ * VALUE is the exact k-th largest count of the cycle, selected
+ * within that bucket by quickselect (ADR-0054) — never a
+ * power-of-two edge. Scale-free by construction: a relative hot
+ * spot qualifies
+ * at ANY traffic volume (a fixed absolute threshold cannot — a
+ * low-volume cycle's top key measured 0 promotions at 80 counts).
+ * {@link #PROMOTION_FLOOR} (10) keeps noise keys (1-9
+ * counts/cycle) out of the hot set. A snapshot below
+ * {@link #MIN_PROMOTION_KEYS} (16) distinct keys skips promotion
+ * entirely (Caffeine's min-signal discipline — the decay reclaims
+ * any slots anyway, so this guards against wasted promotion work,
+ * not permanent pollution). When the exact k-th largest cuts a
+ * tie-band wider than the remaining slots, promotion is incumbent-first:
+ * renewing members are re-promoted before any newcomer (the
+ * pre-decay beacon state — the only last-tide membership memory —
+ * is captured in {@link #incumbentIdx} before the halving decay
+ * zeroes it), so the capacity break never evicts a renewing key and
+ * the hot set stays stable under flat distributions where every
+ * promotion would otherwise be a coin flip. Both the selection and
+ * the split are
+ * routing-only and cost zero per-op; the deliverer pays the bucket
+ * view pass, the quickselect and the tie/blocked pass on scan tides
+ * (O(bucket) expected) plus the incumbent split on overflowing
+ * tides. A stable-workload shortcut (ADR-0057) reuses the previous
+ * tide's exact boundary as a sweep filter, so the selection runs
+ * over the ~hotLimit-key list instead of the bucket whenever the
+ * list provably holds the k-th largest — the flat-distribution
+ * worst case (a boundary bucket the size of the snapshot) degrades
+ * to O(hotLimit) selection on stable workloads.</li>
+ * <li><b>hotLimit = 1024</b> — caps the active promoted hot set so
+ * pathological traffic cannot grow it unboundedly. The routing
+ * beacon is the compact 2+2 role-evidence array of
+ * {@code hotLimit × 32} rooms (≈16 KB at 1024 — no key strings
+ * retained, so cold keys stay GC-eligible), with a ~0.37%
+ * false-positive rate at full capacity — routing-only, never
+ * correctness (a false positive merely routes a cold key onto the
+ * bounded hot path, whose counts converge in the same table).
+ * The beacon is read on EVERY count, so its size has a cache-level
+ * throughput effect — 1024 (16 KB, L1/L2-resident) measured
+ * consistently fastest on a 16-thread sweep; the "capacity starves"
+ * penalty for limits below the hot-key count did not materialize
+ * (the cold path carries un-promoted hot keys without measurable
+ * loss). Throughput-sensitive deployments may lower it further,
+ * capacity-hungry ones may raise it back.</li>
+ * <li><b>Promotion floor, renew-disambiguated governor</b> — the
+ * absolute floor (10) is the seed of a {@link MoonsTidalForce}
+ * (ADR-0045): the floor never filters above the histogram
+ * boundary. Healthy tides with keys blocked behind the floor drop
+ * it toward the boundary so the renewing keys qualify; distress
+ * where the occupied hot slots earn less per slot than cold keys
+ * earn per key (the density-ratio evidence) arms a bounded
+ * raise-walk that filters the stale tail; an empty hot set
+ * collapses the floor to the seed. The raise runs as an
+ * evidence-based, reversible probe (goal verdict, budgeted undo,
+ * retry backoff): an unconditional step would ratchet the floor
+ * past the whole distribution on rotating hot sets and oscillate
+ * forever under key churn. Veto-return, audit clock and
+ * saturation release are kept as defensive machinery; the
+ * histogram boundary stays scale-free. Two volume-gated regime
+ * switches extend it (ADR-0045 §III): a quiet regime (vol &lt;
+ * {@link #QUIET_VOLUME}, empty set) drops the floor to
+ * {@link #QUIET_FLOOR} so any key routes hot, and a RAISED floor
+ * blocking the whole incoming distribution at high volume
+ * collapses in one tide (the flood collapse) instead of the
+ * wrong-direction raise-walk plus the slow decay-driven collapse.
+ * The volume EWMA is folded once per non-empty tide by the
+ * deliverer; both switches are wall-clock-debounced. Three
+ * ADR-0051 refinements bound the probe machine's worst cases:
+ * a raise CONFIRM that lands over-filtering corrects to the
+ * boundary immediately, a confirmed raise shields the re-arm for
+ * {@link #CONFIRM_SHIELD} tides (no alternating-workload
+ * ratchet), and the walk budget binds on both verdict branches.</li>
+ * <li><b>deliverIntervalMs = 500, adaptive</b> — delivery latency is
+ * bounded by one adaptive interval: a tide that delivered ≥ 20,000
+ * distinct keys re-schedules at 50ms, scaling linearly back to the
+ * base as the backlog shrinks — trading burst detection latency
+ * against delivery overhead, self-damping as the reservoir drains.
+ * The ramp is driven by a {@link TidePacer}: the raw backlog is
+ * folded into a smoothed reference with a fast-attack (bursts
+ * shorten the cycle immediately) / slow-release (the fast cadence
+ * drains the reservoir over ~5 tides instead of snapping back)
+ * asymmetry and a still band (in-band jitter moves nothing);
+ * consecutive EMPTY tides stretch the cadence up to 2x the base
+ * (the empty-tide ladder — idle cycles stop paying the quiescence,
+ * decay and wakeup at the base rate), reset by any non-empty tide.</li>
+ * <li><b>SNAPSHOT_QUIESCENCE = 1ms</b> — the price of the cold
+ * approximate window (see the Correctness model). Paid when the
+ * shared table received any write this cycle: the
+ * {@code coldWriteSeen} flag is set by every insert path — cold
+ * first-inserts and every merge (read-gated, so only the first
+ * mark of a cycle pays) — and captured and cleared at the swap.
+ * Entries inserted by ANY path (including hot-path drains) are
+ * visible to cold hit-writers, whose adds need the same window,
+ * so only a cycle with NO shared-table writes skips the window
+ * entirely — and its old table is empty anyway, nothing to lose.
+ * A cycle with table writes pays the same parked wait. The wait
+ * parks instead of spinning, so the cost is a yielded core for
+ * most of the window, not CPU burn.</li>
  * </ul>
  *
- * <p><b>Correctness model:</b>
+ * <p>
+ * <b>Correctness model:</b>
  * <ul>
- *   <li><b>Hot path is exact.</b>  The per-slot counts are atomic
- *       ({@code AtomicLongArray}): the writer's update is a
- *       {@code getAndAdd} and every drain (tide sweep, batch discharge,
- *       tag-driven reconcile) takes the whole value with
- *       {@code getAndSet(0)} — the two are serialized per slot, so a slot
- *       is never torn and a "taken" slot reads exactly 0.  A racing
- *       update that lands on a taken slot observes the 0 return and
- *       recovers its delta exactly via {@code Ceils#recoverZero} (the
- *       prior value is provably already in the shared table), so the hot
- *       path is never lost and never double-counted — the residual is
- *       always precisely the un-merged delta.  The shared-table reference
- *       is captured under {@link #reservoirGate} and the in-flight slot
- *       is reserved atomically with the capture, so the deliverer waiting
- *       for {@link #mergesInFlight} to reach zero can never snapshot a
- *       table that a captured merge still targets — no in-flight hot add
- *       can be stranded.  (A non-atomic read-modify-write loses exactly
- *       one delta when a take lands between the read and the write-back
- *       — ~3e-6/op on the tryLockSkip stress; the atomic protocol
- *       closes it, see ADR-0043.)</li>
- *   <li><b>Cold path is approximate.</b>  A cold writer that captured the
- *       table reference just before the tide swap may write into the old
- *       table after the snapshot.  The tide/destroy quiescence window
- *       (1ms) reduces this to a preemption of &gt; 1ms — measured on
- *       deliver-racing and slow-consumer stress: typical loss 0, worst
- *       observed ≈2.1e-5/op.  The window is gated by the
- *       {@code coldWriteSeen} flag: every insert into the shared table
- *       marks it — cold first-inserts, and every merge (the
- *       writer-side drain paths mark it inside their
- *       {@link #reservoirGate} capture, so a swap racing an in-flight
- *       merge still captures it) — so the window is skipped only on
- *       cycles with NO shared-table writes, whose old table is empty
- *       anyway.  Residual loss with the window paid requires a
- *       preemption &gt; 1ms; a miss-path writer preempted across the swap
- *       re-targets the NEW table via its {@code computeIfAbsent}
- *       re-read.  Sustained hot keys are promoted and then take the
- *       exact path.</li>
+ * <li><b>Hot path is exact.</b> The per-slot counts are atomic
+ * ({@code AtomicLongArray}): the writer's update is a
+ * {@code getAndAdd} and every drain (tide sweep, batch discharge,
+ * tag-driven reconcile) takes the whole value with
+ * {@code getAndSet(0)} — the two are serialized per slot, so a slot
+ * is never torn and a "taken" slot reads exactly 0. A racing
+ * update that lands on a taken slot observes the 0 return and
+ * recovers its delta exactly via {@code Ceils#recoverZero} (the
+ * prior value is provably already in the shared table), so the hot
+ * path is never lost and never double-counted — the residual is
+ * always precisely the un-merged delta. The shared-table reference
+ * is captured under {@link #reservoirGate} and the in-flight slot
+ * is reserved atomically with the capture, so the deliverer waiting
+ * for {@link #mergesInFlight} to reach zero can never snapshot a
+ * table that a captured merge still targets — no in-flight hot add
+ * can be stranded. (A non-atomic read-modify-write loses exactly
+ * one delta when a take lands between the read and the write-back
+ * — ~3e-6/op on the tryLockSkip stress; the atomic protocol
+ * closes it, see ADR-0043.)</li>
+ * <li><b>Cold path is approximate.</b> A cold writer that captured the
+ * table reference just before the tide swap may write into the old
+ * table after the snapshot. The tide/destroy quiescence window
+ * (1ms) reduces this to a preemption of &gt; 1ms — measured on
+ * deliver-racing and slow-consumer stress: typical loss 0, worst
+ * observed ≈2.1e-5/op. The window is gated by the
+ * {@code coldWriteSeen} flag: every insert into the shared table
+ * marks it — cold first-inserts, and every merge (the
+ * writer-side drain paths mark it inside their
+ * {@link #reservoirGate} capture, so a swap racing an in-flight
+ * merge still captures it) — so the window is skipped only on
+ * cycles with NO shared-table writes, whose old table is empty
+ * anyway. Residual loss with the window paid requires a
+ * preemption &gt; 1ms; a miss-path writer preempted across the swap
+ * re-targets the NEW table via its {@code computeIfAbsent}
+ * re-read. Sustained hot keys are promoted and then take the
+ * exact path.</li>
  * </ul>
  *
- * <p><b>Delivery:</b> a self-rescheduling flusher (a one-shot tide that
+ * <p>
+ * <b>Delivery:</b> a self-rescheduling flusher (a one-shot tide that
  * re-arms itself at a backlog-adaptive delay) merges every writer's hot
  * local map, swaps the shared table, waits for in-flight merges plus the
  * gated quiescence window, snapshots the old table into a single map and
- * delivers it once per cycle.  Dead writers' registry entries are removed;
- * their residual local counts are merged first.  An external pressure
+ * delivers it once per cycle. Dead writers' registry entries are removed;
+ * their residual local counts are merged first. An external pressure
  * signal can request an earlier tide via {@link #nudgeTide()} —
  * earliest-first with tolerance coalescing, so multiple nudges merge
  * into at most one schedule (see {@link #tideScheduleGate}).
  *
- * <p><b>Memory:</b> the shared table holds exactly the live key set (no
+ * <p>
+ * <b>Memory:</b> the shared table holds exactly the live key set (no
  * per-batch duplication); each writer's hot local map is bounded by
- * {@code opMaxCount} and the hot set by {@code hotLimit}.  Cold- and
+ * {@code opMaxCount} and the hot set by {@code hotLimit}. Cold- and
  * hot-path {@link LongAdder}s are recycled across cycles from the
  * previous tide's drained table (see {@link #ebbReservoir}), so stable
  * key universes allocate no adders per cycle; the pool is bounded by one
  * cycle's key universe and held behind a single {@link SoftReference} —
  * under memory pressure the GC may clear the whole pool, degrading the
  * reuse to fresh allocations for that cycle (rebuilt at the next tide,
- * an optimization never a correctness contract).  The per-writer
+ * an optimization never a correctness contract). The per-writer
  * {@link Ceils} maps follow the
  * same recycling discipline: dead writers' drained maps are pooled for
  * the next writer (see {@link #ceilPool}, capped at
@@ -291,8 +298,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Default local increments before a bulk add into the shared table.
    *
-   * <p>The knee of a 64/128 sweep on the hot path: the larger batch
-   * measured at or above the smaller across every workload.  Half of
+   * <p>
+   * The knee of a 64/128 sweep on the hot path: the larger batch
+   * measured at or above the smaller across every workload. Half of
    * {@link #LOCAL_CAPACITY},
    * so the open-addressing probe never fills.
    */
@@ -302,10 +310,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Default max age of local hot data before the writer bulk-merges it.
    *
    * @deprecated retained for API compatibility only — the flush-clock
-   *     discharge was removed: the tide loop drains every writer's local
-   *     map each cycle, so low-traffic data reaches the shared table
-   *     within one tide interval instead of on a clock (the value is
-   *     accepted by the constructors but ignored).
+   *             discharge was removed: the tide loop drains every writer's local
+   *             map each cycle, so low-traffic data reaches the shared table
+   *             within one tide interval instead of on a clock (the value is
+   *             accepted by the constructors but ignored).
    */
   @Deprecated
   public static final long DEFAULT_FLUSH_INTERVAL_MS = 50;
@@ -321,7 +329,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * absolute threshold silently fails for keys that carry most of a
    * low-volume cycle's traffic).
    *
-   * <p>This is the {@link #moonsTidalForce}'s seed and lower clamp: the promotion
+   * <p>
+   * This is the {@link #moonsTidalForce}'s seed and lower clamp: the promotion
    * floor is adaptive, never above {@link #FLOOR_MAX}.
    */
   private static final int PROMOTION_FLOOR = 10;
@@ -331,7 +340,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * WindowClimber's min-signal discipline): a snapshot with fewer
    * distinct keys than this carries no meaningful distribution — the
    * histogram boundary would collapse to the smallest non-zero bucket
-   * and promote everything.  The decay would reclaim the slots within 4
+   * and promote everything. The decay would reclaim the slots within 4
    * tides anyway, so this guards against wasted promotion work on
    * startup noise, not permanent pollution; below this size the
    * promotion pass is skipped entirely.
@@ -346,7 +355,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * ({@link #QUIET_FLOOR} = 1) so ANY key routes hot (the fast-add path),
    * and the {@link #MIN_PROMOTION_KEYS} scan gate is lifted so sub-minimum
    * quiet snapshots still promote (the ADR-0038 decay freeze cannot leave a
-   * stale floor behind a frozen set).  The seed floor re-engages at
+   * stale floor behind a frozen set). The seed floor re-engages at
    * {@link #QUIET_REENGAGE_VOLUME} (2x the entry — hysteresis band against
    * volume hovering at the boundary).
    */
@@ -367,10 +376,16 @@ public class WaveCounter implements InitializingBean, Destroyable {
    */
   private static final long QUIET_CONFIRM_MS = 2_000;
 
-  /** See {@link #QUIET_CONFIRM_MS}: the re-engage confirm (fast — a burst must return quickly). */
+  /**
+   * See {@link #QUIET_CONFIRM_MS}: the re-engage confirm (fast — a burst must
+   * return quickly).
+   */
   private static final long NOISE_CONFIRM_MS = 500;
 
-  /** EWMA weight of the per-tide volume signal (fast — the regime switches are wall-clock-debounced). */
+  /**
+   * EWMA weight of the per-tide volume signal (fast — the regime switches are
+   * wall-clock-debounced).
+   */
   private static final double VOLUME_ALPHA = 0.5;
 
   /**
@@ -382,18 +397,22 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * keep the existing bounded self-healing (4-tide decay + empty-set
    * collapse).
    *
-   * <p>A 2500 counts/sec variant was validated in the ADR-0051 sandbox
+   * <p>
+   * A 2500 counts/sec variant was validated in the ADR-0051 sandbox
    * campaign (modest excess/collapse wins on the expanded corpus) and
    * REJECTED: at 2500 the signature also fires on legitimate quiet windows
    * at 2500-5000 counts/sec — a raise-walk in flight over a set that
    * briefly reads renewal 0 — flood-collapsing the walk and locking the
-   * arm on a transient, not a regime change.  The 5000 gate reserves the
+   * arm on a transient, not a regime change. The 5000 gate reserves the
    * instant collapse for genuinely high-volume stale floors; moderate
    * ones keep the bounded self-healing.
    */
   private static final long FLOOD_RATE_PER_SEC = 5_000;
 
-  /** Minimum snapshot distinct keys for the flood signature (tiny snapshots are noise, not floods). */
+  /**
+   * Minimum snapshot distinct keys for the flood signature (tiny snapshots are
+   * noise, not floods).
+   */
   private static final int FLOOD_MIN_DISTINCT = 32;
 
   /**
@@ -410,7 +429,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Initial capacity AND shrink floor of the deliverer-side reused scan
    * arrays ({@link #allValues}, {@link #allHashes}, {@link #candidateIdx},
    * {@link #bucketIdx}, {@link #aboveKthIdx}, {@link #incumbentIdx},
-   * {@link #newcomerIdx}).  As the floor it bounds the shrink in
+   * {@link #newcomerIdx}). As the floor it bounds the shrink in
    * {@link #shrinkScanArrays(int)}: a workload whose steady state sits at
    * or below this size never resizes the arrays at all (the pre-change
    * footprint), so the shrink only ever reclaims the overshoot of a past
@@ -421,7 +440,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Shrink hysteresis factor for the reused scan arrays: an array is
    * downsized only when it holds at least this multiple of the current
-   * tide's need (see {@link #shrinkScanArrays(int)}).  The band keeps
+   * tide's need (see {@link #shrinkScanArrays(int)}). The band keeps
    * cardinality oscillation from resizing on every tide — an array must
    * drift to 4x the working set before a copy is paid, and a rebounding
    * workload regrows into the retained slack for free.
@@ -429,9 +448,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
   private static final int SCAN_ARRAY_SHRINK_FACTOR = 4;
 
   /**
-   * Default maximum number of promoted hot keys (capped; further promotions are skipped).
+   * Default maximum number of promoted hot keys (capped; further promotions are
+   * skipped).
    *
-   * <p>The counting beacon is ~16 KB at this limit vs ~64 KB at 4096, and
+   * <p>
+   * The counting beacon is ~16 KB at this limit vs ~64 KB at 4096, and
    * every count reads it — a 16-thread sweep across five workloads
    * measured +16..36% throughput at 1024, including an N=2000 hot-key load
    * that exceeds the capacity (the cold path carries un-promoted hot keys
@@ -445,12 +466,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * space is {@code hotLimit * 32} rooms, and the power-of-two sizing loop
    * must terminate on a positive {@code int} bit count — a room space at or
    * above 2^31 would overflow the loop's bit count to a negative mask and
-   * mis-index (or OOM on) the beacon array.  A math guard, not a sizing
+   * mis-index (or OOM on) the beacon array. A math guard, not a sizing
    * knob — no real hot set approaches it.
    */
   private static final int MAX_HOT_LIMIT = 1 << 25;
 
-  /** Quiescence window after the table swap before snapshotting (see class doc). */
+  /**
+   * Quiescence window after the table swap before snapshotting (see class doc).
+   */
   private static final long SNAPSHOT_QUIESCENCE_NANOS = 1_000_000L; // 1ms
 
   /**
@@ -524,8 +547,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * consecutive EMPTY tide stretches the next cadence by a power of two,
    * capping at this multiple of {@code deliverIntervalMs} — idle cycles
    * stop paying the 1ms quiescence, the decay sweep and the scheduler
-   * wakeup every 500ms.  Any non-empty tide resets the streak (the
-   * ladder's confirm).  The stretch is capped at 2x so a burst is
+   * wakeup every 500ms. Any non-empty tide resets the streak (the
+   * ladder's confirm). The stretch is capped at 2x so a burst is
    * detected within at most two base intervals.
    */
   private static final int EMPTY_TIDE_STRETCH_CAP_MULTIPLE = 2;
@@ -542,11 +565,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
    */
   private static final double RENEWAL_TARGET = 0.5;
 
-  /** Promotion-governor ceiling on the floor; the seed and lower clamp are {@link #PROMOTION_FLOOR}. */
+  /**
+   * Promotion-governor ceiling on the floor; the seed and lower clamp are
+   * {@link #PROMOTION_FLOOR}.
+   */
   private static final int FLOOR_MAX = 256;
 
   /**
-   * Promotion-governor initial probe step, in count units.  Dual role since
+   * Promotion-governor initial probe step, in count units. Dual role since
    * ADR-0053: the upper bound (and saturation point) of the density-priced
    * raise stride (a raise below the density gate never moves more than this
    * per tide), and the first stride of a release walk (the arm's stride is
@@ -555,10 +581,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
   private static final int STEP_INITIAL = 8;
 
   /**
-   * Release-walk stride ceiling.  The release law prices the stride from
+   * Release-walk stride ceiling. The release law prices the stride from
    * the smoothed renewal against the walk's own crash bar, clamped to
    * [1, {@value}]; the ceiling keeps a fully healthy set from traversing
-   * the whole floor domain in a single tide.  It is intentionally not
+   * the whole floor domain in a single tide. It is intentionally not
    * scaled with {@link #STEP_INITIAL}: the raise direction uses smaller,
    * more conservative steps while a healthy release may still move faster
    * back toward the seed.
@@ -576,7 +602,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Anchor stable band (WindowClimber's {@code Reading.stableBand}
    * discipline): the veto requires the floor to be measurably AWAY from
    * the last confirmed anchor — more than this many counts above
-   * {@code anchorFloor}.  2% of the floor domain ({@link #FLOOR_MAX}),
+   * {@code anchorFloor}. 2% of the floor domain ({@link #FLOOR_MAX}),
    * floored at 1, so a raise that confirmed leaves the floor at least one
    * full probe step above the anchor and every legitimate veto still
    * fires; only 1-2-count jitter around the anchor is absorbed (a veto
@@ -591,7 +617,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * arm-confirm cycle — the alternating-workload ratchet (arm at F, 3
    * at-target tides, confirm at F, immediate re-arm; each cycle that
    * passes the step gates ratchets the floor up until the empty-set
-   * collapse has to undo the probe).  The rung is NOT touched (only the
+   * collapse has to undo the probe). The rung is NOT touched (only the
    * reward state), so a genuine regime shift re-arms once the shield
    * expires; the release direction is unaffected (its ladder is separate).
    * Chosen at 8 from the sandbox sweep (s4/s6/s8, 250 paired expanded
@@ -603,7 +629,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
    */
   private static final int CONFIRM_SHIELD = 8;
 
-  /** Promotion-governor budgeted retreat strides (WindowClimber's veto-return). */
+  /**
+   * Promotion-governor budgeted retreat strides (WindowClimber's veto-return).
+   */
   private static final int RETURN_BUDGET = 8;
 
   /** Per-stride cap while returning to the probe base. */
@@ -612,12 +640,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Direction-probe window (ADR-0058, WindowClimber's direction probing):
    * tides the veto HOLDS the current position and samples the live
-   * renewal before committing to a retreat.  A recovery (at or above
+   * renewal before committing to a retreat. A recovery (at or above
    * {@link #RENEWAL_TARGET}) within the window settles here and re-plants
    * the anchor — the veto's direction hypothesis (down toward the anchor)
    * is only a hypothesis; the confirm floor's verified claim is the
-   * counter-evidence.  A persistent shortfall deepens to the shallow
-   * interval target ({@code anchorConfirmFloor}) or the base.  A single
+   * counter-evidence. A persistent shortfall deepens to the shallow
+   * interval target ({@code anchorConfirmFloor}) or the base. A single
    * tide would let a noise blip settle a veto; the sampled minimum
    * mirrors the walk's own 3-tide confirm discipline at the veto scale.
    */
@@ -646,7 +674,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@code RESTART_THRESHOLD}): a single-tide move of the goal metric
    * (renewal) at or above this announces a regime change — the governor
    * re-learns its references from here instead of smoothing across the
-   * shift.  The renewal is a per-tide ratio (one sample per promoted
+   * shift. The renewal is a per-tide ratio (one sample per promoted
    * tide), noisier than Caffeine's request-aggregated hit rate, so the
    * parked-state stand-down is the only consumer and the walk/retreat
    * machinery — which expects renewal swings — is untouched.
@@ -661,15 +689,21 @@ public class WaveCounter implements InitializingBean, Destroyable {
    */
   private static final int AUDIT_WAIT_MAX = 2 * MoonsTidalForce.TIDAL_BACKOFF_MAX;
 
-  /** Promotion-governor saturation fraction: the hot set is "full" at 90% of {@link #hotLimit}. */
+  /**
+   * Promotion-governor saturation fraction: the hot set is "full" at 90% of
+   * {@link #hotLimit}.
+   */
   private static final double SATURATION_FRACTION = 0.9;
 
-  /** Local map capacity (power of two); must be ≥ 2 × opMaxCount so probing never fills it. */
+  /**
+   * Local map capacity (power of two); must be ≥ 2 × opMaxCount so probing never
+   * fills it.
+   */
   private static final int LOCAL_CAPACITY = 256;
 
   /**
    * Ceils-pool cap: the maximum number of drained per-writer hot maps
-   * retained for reuse (~7KB each ≈ 1.8MB at the cap).  A burst of thread
+   * retained for reuse (~7KB each ≈ 1.8MB at the cap). A burst of thread
    * deaths with no new writers must not pin the whole wave's maps forever;
    * the steady-state pool is one tide's dead-writer count anyway (the
    * {@link #ebbReservoir} bound, applied to maps).
@@ -679,9 +713,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Upper bound for pre-sizing the fresh shared table at each tide swap.
    *
-   * <p>The new table is sized from the cycle's approximate distinct-key
+   * <p>
+   * The new table is sized from the cycle's approximate distinct-key
    * count so high-cardinality workloads avoid repeated {@link
-   * ConcurrentHashMap} resizes.  The cap keeps a pathological burst from
+   * ConcurrentHashMap} resizes. The cap keeps a pathological burst from
    * pinning a needlessly large empty table; beyond this the table simply
    * grows on demand as before.
    */
@@ -692,72 +727,79 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
   /**
    * Cadence of shared-table snapshot delivery, clamped up to
-   * {@link #EARLY_TIDE_MIN_INTERVAL_MS} at construction.  {@link #scheduleTide}
+   * {@link #EARLY_TIDE_MIN_INTERVAL_MS} at construction. {@link #scheduleTide}
    * clamps every fire to that floor anyway, so a sub-floor configuration would
    * only desynchronize the interval the loop reports from the cadence it
    * actually runs — and an unclamped {@code 0} reaches the governor's flood-rate
    * normalization ({@code computeQps}) as a division by zero: an
    * {@code +Infinity} counts/sec rate that trivially satisfies the P2 flood
-   * signature's rate gate.  The config layer ({@code zeta.local.report-interval-ms})
+   * signature's rate gate. The config layer
+   * ({@code zeta.local.report-interval-ms})
    * does not validate the value, so the clamp lives at the consumption point.
    */
   private final long deliverIntervalMs;
 
-  /** Maximum number of promoted hot keys (capped; further promotions are skipped). */
+  /**
+   * Maximum number of promoted hot keys (capped; further promotions are skipped).
+   */
   private final int hotLimit;
 
   /**
-   * Promoted hot-key routing beacon.  A fast membership test on the hot
+   * Promoted hot-key routing beacon. A fast membership test on the hot
    * path (~3-10ns) decides the routing — consulted only when the writer's
    * last-key cache misses (see {@link Ceils#tryFastAdd}); sustained hot
    * keys are promoted by the delivery-time scan, capped at {@link #hotLimit}.
    *
-   * <p><b>Compact 2+2 role evidence.</b>  The beacon is one
+   * <p>
+   * <b>Compact 2+2 role evidence.</b> The beacon is one
    * array over the room space (sized {@code hotLimit × 32} rooms, rounded
    * to a power of two), 4 bits per room (16 rooms per long): low 2 bits
    * = the bit1-role evidence, high 2 bits = the bit2-role evidence
    * (~16 KB at the default 1024 limit).
    * <ul>
-   *   <li><b>Each role needs only 2 bits (saturating at 3)</b>: the
-   *       first-promotion seed of 2 plus the halving sweep
-   *       {@code >> 1} (see {@link #decayCounts()}), run on every other
-   *       promoted tide (ADR-0049), gives the 4-tide memory — a drifted-away
-   *       key leaves within 4 non-empty tides, a new hot
-   *       key can be promoted on any tide (no freeze at capacity), a
-   *       stable hot key re-promotes every tide and never decays out (no
-   *       ping-pong), and a periodic earner (earn/miss/miss) stays
-   *       hot-routed on its earn tides.
-   *       Member test: both role evidences {@code >= 1}.</li>
-   *   <li><b>Role separation is the k=2 point</b>: a room serves two
-   *       roles — as some key's bit1 (count evidence) and as another
-   *       key's bit2 (trace evidence).  The two 2-bit fields are
-   *       independent, so a promoted key always satisfies both (no false
-   *       negatives), and a false positive needs both a polluted count
-   *       room AND a polluted trace room.  When both of a key's hashes
-   *       land in the same room (1/32768), the fields stay independent
-   *       (each written to its own half).</li>
+   * <li><b>Each role needs only 2 bits (saturating at 3)</b>: the
+   * first-promotion seed of 2 plus the halving sweep
+   * {@code >> 1} (see {@link #decayCounts()}), run on every other
+   * promoted tide (ADR-0049), gives the 4-tide memory — a drifted-away
+   * key leaves within 4 non-empty tides, a new hot
+   * key can be promoted on any tide (no freeze at capacity), a
+   * stable hot key re-promotes every tide and never decays out (no
+   * ping-pong), and a periodic earner (earn/miss/miss) stays
+   * hot-routed on its earn tides.
+   * Member test: both role evidences {@code >= 1}.</li>
+   * <li><b>Role separation is the k=2 point</b>: a room serves two
+   * roles — as some key's bit1 (count evidence) and as another
+   * key's bit2 (trace evidence). The two 2-bit fields are
+   * independent, so a promoted key always satisfies both (no false
+   * negatives), and a false positive needs both a polluted count
+   * room AND a polluted trace room. When both of a key's hashes
+   * land in the same room (1/32768), the fields stay independent
+   * (each written to its own half).</li>
    * </ul>
    * Counting is monotonic (values decay toward zero, never wrap), so the
    * trace density is bounded by the recent promotions — no historical
    * drift, no epoch alias; the false-positive rate stays ~0.04% instead
-   * of rising toward the k=1 level.  Only the single deliverer thread
-   * writes the array (read-modify-write, no CAS needed).  Writers read via
+   * of rising toward the k=1 level. Only the single deliverer thread
+   * writes the array (read-modify-write, no CAS needed). Writers read via
    * PLAIN (non-volatile) array loads: the beacon is routing-only, so a
    * stale read is harmless — a writer that has not yet observed a
    * promotion merely routes the key down the cold path, which is always
-   * correct (the same key is re-promoted next tide).  Hardware cache
+   * correct (the same key is re-promoted next tide). Hardware cache
    * coherence (immediate on x86 TSO, eventual on weaker architectures)
    * bounds the staleness in practice; the JMM does not guarantee when the
-   * update is seen, and correctness never depends on it.  A torn 64-bit
+   * update is seen, and correctness never depends on it. A torn 64-bit
    * load is non-tearing in practice on HotSpot for aligned accesses, and
    * would be harmless anyway — garbage evidence reads as a false negative,
-   * which routes cold (correct).  See ADR-0038 (consolidated WaveCounter tide controls).
+   * which routes cold (correct). See ADR-0038 (consolidated WaveCounter tide
+   * controls).
    *
-   * <p><b>Accepted imperfection.</b>  The evidence value is a memory
-   * mark, not a literal promotion count (first seed is 2).  Routing-only,
+   * <p>
+   * <b>Accepted imperfection.</b> The evidence value is a memory
+   * mark, not a literal promotion count (first seed is 2). Routing-only,
    * never correctness.
    *
-   * <p><b>Why k=2 is deliberate.</b> The optimal hash count for a Bloom
+   * <p>
+   * <b>Why k=2 is deliberate.</b> The optimal hash count for a Bloom
    * filter is {@code k = (m/n)·ln2} — at our {@code m/n = 32} that is ≈22,
    * which would push the false-positive rate from 0.37% down to ~1e-7 at
    * the same memory. We deliberately do not chase that: false positives are
@@ -781,7 +823,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * survives up to three quiet tides before its slots free, which is the
    * designed cost that keeps periodic earners (earn/miss/miss patterns) on
    * the hot path (validated in the zeta-tidal-sim sandbox,
-   * {@code mem_adapt_exp.py} — the M4 variant).  The sweep is a
+   * {@code mem_adapt_exp.py} — the M4 variant). The sweep is a
    * deliverer-side phase, never a per-op cost.
    */
   private static final int DECAY_PERIOD = 2;
@@ -791,12 +833,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * counts down from {@link #DECAY_PERIOD}; the tide on which it reads
    * {@code 1} runs the halving decay and the clock restarts at
    * {@link #DECAY_PERIOD}, and each intervening tide freezes the evidence
-   * and only counts the active size ({@code countActive(1)}).  The
+   * and only counts the active size ({@code countActive(1)}). The
    * clock is advanced by the deliverer once per promoted tide, exactly
    * where the decay gate chooses {@link #decayCounts()} vs
    * {@code countActive(1)} — tides that skip the scan (empty,
    * sub-minimum) freeze the evidence AND do not advance the clock (the
-   * ADR-0038 decay-gate freeze extends to the sweep clock).  Starts at
+   * ADR-0038 decay-gate freeze extends to the sweep clock). Starts at
    * {@code 1} — and is reset to {@code 1} by {@link #clear()}
    * (blank-slate contract) — so the first promoted tide after
    * construction or a clear runs the decay.
@@ -809,11 +851,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * per-map {@link ReentrantLock} (or lock-free for dead writers —
    * see {@code drainDead}).
    *
-   * <p>The value is <em>deliberately retained</em> across tide cycles:
+   * <p>
+   * The value is <em>deliberately retained</em> across tide cycles:
    * a pooled writer keeps reusing the same Ceils, so {@code remove()} is
    * never the right call — the registry entry is reclaimed by the deliverer
    * when the thread dies (isAlive), and a retired thread's ThreadLocalMap is
-   * collected with the thread itself.  No leak, no cleanup hook.
+   * collected with the thread itself. No leak, no cleanup hook.
    */
   @SuppressWarnings("java:S5164") // retained for pooled-writer reuse; reclaimed via hotRegistry
   private final ThreadLocal<Ceils> hotLocals = new ThreadLocal<>();
@@ -828,16 +871,17 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Ceils recycling pool (the {@link #ebbReservoir} pattern applied to the
    * per-writer hot maps): a DEAD writer's fully-drained map is reset and
    * returned here by the tide, and the first hot count of a NEW writer
-   * claims it instead of allocating.  Virtual-thread and
+   * claims it instead of allocating. Virtual-thread and
    * per-request-thread deployments churn writers at request rate; without
    * the pool every request would allocate a ~7KB local map that dies with
    * its thread and is only reaped at the next tide.
    *
-   * <p><b>Invariants.</b> Only the deliverer pushes (dead writers' maps,
+   * <p>
+   * <b>Invariants.</b> Only the deliverer pushes (dead writers' maps,
    * post-{@code drainDead} + {@link Ceils#reset()} — the dead thread can
    * never touch the map again, so a pooled instance is single-owner
    * forever); any writer claims (first hot count per thread, off the
-   * steady-state path).  The pool is capped at {@link #CEIL_POOL_CAP} so a
+   * steady-state path). The pool is capped at {@link #CEIL_POOL_CAP} so a
    * one-time wave of thread deaths cannot retain its maps permanently.
    */
   private final ConcurrentLinkedQueue<Ceils> ceilPool = new ConcurrentLinkedQueue<>();
@@ -846,50 +890,54 @@ public class WaveCounter implements InitializingBean, Destroyable {
   private final AtomicInteger ceilPoolSize = new AtomicInteger();
 
   /**
-   * Shared table, swapped wholesale at every delivery.  The {@code volatile}
+   * Shared table, swapped wholesale at every delivery. The {@code volatile}
    * qualifier gives the <em>reference replacement</em> semantics (a writer
    * either sees the old table or the fresh one); the table's internal state
    * is made safe by {@link ConcurrentHashMap} itself plus
-   * {@link #reservoirGate} around reference capture and swap.  Same pattern
+   * {@link #reservoirGate} around reference capture and swap. Same pattern
    * as {@code KeyReporterImpl.bbrRateLimiter}.
    */
   @SuppressWarnings("java:S3077")
-  // volatile reference: replacement semantics, state guarded by CHM + reservoirGate
+  // volatile reference: replacement semantics, state guarded by CHM +
+  // reservoirGate
   private volatile ConcurrentHashMap<String, LongAdder> reservoir = new ConcurrentHashMap<>();
 
   /**
    * Adder recycling pool: the previous cycle's drained table, published by
    * the deliverer (volatile) only AFTER every adder was summed — the pool
    * therefore holds only fully-consumed adders whose counts already entered
-   * a snapshot.  Cold-path first inserts and hot-path batch drains
+   * a snapshot. Cold-path first inserts and hot-path batch drains
    * ({@code Ceils.waveTo}) steal one from here instead of allocating (see
    * {@link #stealRecycled}), eliminating the per-cycle LongAdder churn
    * for stable key universes.
    *
-   * <p>The whole map is held behind a SINGLE {@link SoftReference} (the
+   * <p>
+   * The whole map is held behind a SINGLE {@link SoftReference} (the
    * drained table is published as the pool unchanged — zero per-key
    * wrapping): under memory pressure the GC may clear the referent, and
    * every steal then returns {@code null} so the merge falls back to a
    * fresh allocation — recycling is an optimization, never a correctness
-   * contract.  The pool is only ever <em>consumed</em> (never the live
+   * contract. The pool is only ever <em>consumed</em> (never the live
    * {@link #reservoir}), so a cleared pool loses nothing but the reuse;
    * it is rebuilt at the next tide, so the degradation is bounded to at
-   * most one cycle.  A steal that observed the referent holds a strong
+   * most one cycle. A steal that observed the referent holds a strong
    * reference to the map, so the GC cannot clear it mid-steal (no torn
    * state — either the deref succeeds and the whole {@code remove/reset}
    * sequence is safe, or it returns {@code null} and the caller allocates).
    *
-   * <p>Zeroing happens at steal time ({@link LongAdder#reset()}), not at
+   * <p>
+   * Zeroing happens at steal time ({@link LongAdder#reset()}), not at
    * snapshot time, so the tide keeps paying only the read-only
-   * {@code sum()} it always paid.  A stolen adder's residual (the previous
+   * {@code sum()} it always paid. A stolen adder's residual (the previous
    * cycle's count, or a late cold write from a writer preempted across the
    * quiescence window) is reset away — lost exactly like the documented cold
    * approximate window, never carried into the next cycle.
    *
-   * <p>Memory is bounded by one cycle's key universe: at every tide the
+   * <p>
+   * Memory is bounded by one cycle's key universe: at every tide the
    * just-drained old table is published as the pool wholesale (one
    * {@code SoftReference} allocation, no per-key wrapper) — the previous
-   * pool is dropped.  {@link #clear()} and {@link #destroy()} drop the
+   * pool is dropped. {@link #clear()} and {@link #destroy()} drop the
    * pool reference so no recycled state survives a reset.
    */
   @SuppressWarnings("java:S3077")
@@ -903,7 +951,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
   private final Object reservoirGate = new Object();
 
   /**
-   * In-flight hot merges into a captured table.  Delivery waits for this to
+   * In-flight hot merges into a captured table. Delivery waits for this to
    * reach zero before snapshotting, guaranteeing the snapshot sees a
    * quiescent table for hot-path data.
    */
@@ -917,13 +965,13 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
   /**
    * Lifecycle flag: {@code true} after {@link #destroy()} — new {@code count()}
-   * calls no-op.  Read on EVERY count (both the hot and the cold path), so the
+   * calls no-op. Read on EVERY count (both the hot and the cold path), so the
    * per-op read is the cheapest access mode that preserves the destroy
-   * contract: OPAQUE via {@link #SHUTDOWN}.  The contract is eventual
+   * contract: OPAQUE via {@link #SHUTDOWN}. The contract is eventual
    * visibility, not ordering — destroy's residual loss window for a writer
    * that raced past the store is documented as ns-scale, and opaque only
    * widens it by the store-propagation latency (~40-80ns); no cross-variable
-   * chain depends on this flag (unlike {@link #coldWriteSeen}).  The
+   * chain depends on this flag (unlike {@link #coldWriteSeen}). The
    * destroy/tide-path accesses stay VOLATILE (once per destroy/tide, so the
    * barrier is free there) so the shutdown store is a proper publish point.
    */
@@ -942,7 +990,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
     }
   }
 
-  /** Whether {@link #afterPropertiesSet()} started the self-rescheduling delivery chain. */
+  /**
+   * Whether {@link #afterPropertiesSet()} started the self-rescheduling delivery
+   * chain.
+   */
   private volatile boolean deliveryStarted;
 
   /**
@@ -962,7 +1013,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
   private volatile long lastTideErrorLoggedAtMs = -TIDE_ERROR_LOG_WINDOW_MS;
 
   /**
-   * Tide failures suppressed inside the current {@link #TIDE_ERROR_LOG_WINDOW_MS}ms
+   * Tide failures suppressed inside the current
+   * {@link #TIDE_ERROR_LOG_WINDOW_MS}ms
    * window — reported by the next window-opening ERROR line so the true
    * failure volume stays visible at the throttled cadence.
    */
@@ -979,7 +1031,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Overshoot headroom on the cold-path capacity guard
    * ({@link #capacity} / 10): new keys are admitted until the table
-   * reaches {@code capacity + capacityHeadroom} distinct keys.  The guard
+   * reaches {@code capacity + capacityHeadroom} distinct keys. The guard
    * exists to bound memory, not exactness, and the pacer keeps the
    * steady-state reservoir ~5x below the cap — the headroom absorbs the
    * remaining burst edge so the drop (whose policy biases against NEW
@@ -991,12 +1043,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * O(1) distinct-key counter for the cold-path capacity guard —
    * {@code ConcurrentHashMap.size()} reads the CHM counter cells
-   * (O(cores) volatile reads) on every miss.  Incremented exactly once
+   * (O(cores) volatile reads) on every miss. Incremented exactly once
    * per real first insert into the current table: the cold miss branch in
    * {@code count()} bumps it on the {@code putIfAbsent} winner, and the
    * hot-path drains ({@code Ceils.waveTo}) bump it the same way — a
    * promoted key's first merge into the fresh table is a first insert
-   * too.  Reset at every table swap.  Approximately equal to the table's
+   * too. Reset at every table swap. Approximately equal to the table's
    * distinct-key count except for the swap race window (a first-insert
    * that captured the OLD table reference after the reset over-counts by
    * one until the next swap, and a drain racing a swap may bump a
@@ -1004,24 +1056,26 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * correctly not counted) — well within the documented "approximate
    * (racy size check)" semantics.
    *
-   * <p><b>Why not LongAdder?</b> A swap was evaluated with a desktop
-   * micro-benchmark (JDK 26, tight-loop and ~200k/s paced regimes).  The
+   * <p>
+   * <b>Why not LongAdder?</b> A swap was evaluated with a desktop
+   * micro-benchmark (JDK 26, tight-loop and ~200k/s paced regimes). The
    * guard read and the increment are SAME-FREQUENCY on the cold-miss path
    * (capacity &gt; 0 only), so LongAdder trades cheap CAS increments for a
    * cell-walking {@code sum()} that measured 3-9x slower per read than
    * {@code get()}; in the realistic paced regime the whole counter cost
-   * is ~2% of per-op time and the swap measured a flat 1.0x.  The only
+   * is ~2% of per-op time and the swap measured a flat 1.0x. The only
    * LongAdder win (30% at 16 threads) appeared in a tight-loop regime
    * that WaveCounter cannot reach — increments are bounded by the
    * per-cycle distinct-key rate, not the op rate.
    *
-   * <p><b>Weak access modes.</b>  The counter is stored as a plain
+   * <p>
+   * <b>Weak access modes.</b> The counter is stored as a plain
    * {@code long} and accessed only through the {@code APPROXIMATE_SIZE}
    * {@link VarHandle}: reads and the tide reset use opaque mode
    * ({@code getOpaque} / {@code setOpaque}), the increment uses
    * {@code getAndAddRelease} (the RMW family has no opaque variant;
    * release is the weakest available and its one-way ordering is
-   * harmless here).  The field is single-variable and approximate — no
+   * harmless here). The field is single-variable and approximate — no
    * cross-variable ordering is ever required (a stale read falls inside
    * the documented "approximate (racy size check)" semantics), so the
    * weak modes (atomic, coherent, no full barriers) replace the
@@ -1036,6 +1090,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
   static {
     try {
       APPROXIMATE_SIZE = MethodHandles.lookup().findVarHandle(WaveCounter.class, "approximateSizeValue", long.class);
+      COLD_WRITE_SEEN = MethodHandles.lookup().findVarHandle(WaveCounter.class, "coldWriteSeen", boolean.class);
     } catch (ReflectiveOperationException e) {
       throw new ExceptionInInitializerError(e);
     }
@@ -1046,12 +1101,13 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * the entry becomes visible, cleared by the deliverer at table swap.
    * When unset, no insert has happened this cycle — the old table at the
    * swap is empty and nothing can be lost — and the tide skips the 1ms
-   * quiescence window; when set, the window is paid.  A miss-path writer
+   * quiescence window; when set, the window is paid. A miss-path writer
    * preempted across the swap re-targets
    * the NEW table (its computeIfAbsent re-reads the field), so the flag
    * cannot lose a write by itself.
    *
-   * <p>Set by EVERY real insert into the shared table: the cold-miss
+   * <p>
+   * Set by EVERY real insert into the shared table: the cold-miss
    * branch in {@code count} (before the insert — the drop branch returns
    * before it, so a dropped key never marks), every merge
    * ({@link #mergeKey}, before the {@code putIfAbsent} makes the entry
@@ -1061,20 +1117,41 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * captures the mark — a hit on an entry inserted by ANY path (cold
    * miss, hot drain, reconcile, recovery) is a cold write too, and the
    * window is the bound it documents.
-   * The store is read-gated ({@code if (!coldWriteSeen) coldWriteSeen = true;}):
+   * The store is read-gated (opaque read, then release write):
    * the flag is monotonic within a cycle, so only the first mark of a
    * cycle pays (a CAS would cost a locked RMW per mark — more than the
-   * store it replaces).  The read-then-store race is benign: both writers
+   * store it replaces). The read-then-store race is benign: both writers
    * store anyway, and the only ordering that matters — a store landing
    * before the tide's gate-acquire — is unchanged (a writer that observes
    * the flag already set inserts with the window already gated on).
+   *
+   * <p>
+   * <b>Asymmetric access modes (ADR-0045 §II weak-ordering).</b> The
+   * field is managed by {@link #COLD_WRITE_SEEN}: the writer's mark uses
+   * an OPAQUE read (self-visibility within the same cycle — a stale read
+   * only ADDS a spurious mark, which is idempotent) and a RELEASE write
+   * (any cold-path store before the tide's synchronized gate-acquire is
+   * ordered before the gate). The deliverer's swap-path capture and
+   * clear use ACQUIRE read and RELEASE write respectively, pairing with
+   * the writer's release store so the tide observes every mark that
+   * landed before it entered {@code synchronized(reservoirGate)}. On x86
+   * (TSO) all modes are plain loads/stores — a no-op; on AArch64 the
+   * writer-side read drops {@code ldar → ldr} and the write stays
+   * {@code stlr} (release, cheaper than the volatile {@code dmb ish; str}).
    */
-  private volatile boolean coldWriteSeen;
+  @SuppressWarnings("unused")
+  private boolean coldWriteSeen;
+
+  /**
+   * Access handle for {@link #coldWriteSeen} (opaque read, release write, acquire
+   * read).
+   */
+  private static final VarHandle COLD_WRITE_SEEN;
 
   /**
    * Pacing state for the adaptive tide cadence: EWMA-smoothed
    * backlog (fast attack, slow release, still band) plus the empty-tide
-   * stretch ladder.  Written only by the deliverer thread, so no
+   * stretch ladder. Written only by the deliverer thread, so no
    * synchronization.
    */
   private final TidePacer pacer = new TidePacer();
@@ -1085,22 +1162,25 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@link #nudgeTide()} that requests a meaningfully earlier fire
    * cancels and replaces the pending one-shot, and requests within
    * {@link #SCHEDULE_TOLERANCE_MS} of the pending fire are merged
-   * (skipped).  Delays are clamped up to
+   * (skipped). Delays are clamped up to
    * {@link #EARLY_TIDE_MIN_INTERVAL_MS} and {@link #nextFireTimeMs}
    * keeps a {@code 0} sentinel for "unscheduled" (the sentinel is never
    * committed as a fire time — {@code scheduleAt == 0} maps to 1).
    *
-   * <p><b>Why synchronized.</b>  The self-reschedule runs on the
+   * <p>
+   * <b>Why synchronized.</b> The self-reschedule runs on the
    * deliverer thread, but a nudge may arrive from ANY thread (an
    * external pressure signal), so the pending-future state is guarded —
    * a racy double-arming would run two concurrent tides and race the
-   * table swap (two {@link #tideWatcher()} rotations).  The cost is
+   * table swap (two {@link #tideWatcher()} rotations). The cost is
    * paid on the scheduling path only (once per tide plus per nudge),
    * never per count.
    */
   private final Object tideScheduleGate = new Object();
 
-  /** Fire time of the pending tide (monotonic clock, ms); {@code 0} = unscheduled. */
+  /**
+   * Fire time of the pending tide (monotonic clock, ms); {@code 0} = unscheduled.
+   */
   private long nextFireTimeMs;
 
   /** The single pending one-shot tide (guarded by {@link #tideScheduleGate}). */
@@ -1122,14 +1202,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
   /**
    * Sum of the positive counts in the snapshot built by the last
-   * {@link #tideWatcher()} call (deliverer-only).  The snapshot build
+   * {@link #tideWatcher()} call (deliverer-only). The snapshot build
    * dereferences every adder for {@code v.sum()} anyway, so the governor's
    * volume signal is accumulated there for free instead of a second O(n) pass
    * over the delivered map in {@link #promote(Map, long)} (the ADR-0055
-   * "one extra O(n) value pass" accepted cost, eliminated).  Consumed only by
+   * "one extra O(n) value pass" accepted cost, eliminated). Consumed only by
    * the immediately following {@code promote} of the same non-empty tide —
    * a {@code null} (empty-table) return never reaches {@code promote}, so the
-   * field is written exactly where a consumer exists.  The fold still happens
+   * field is written exactly where a consumer exists. The fold still happens
    * BEFORE the scan gate in {@code promote} (the volume EWMA must fold on
    * every non-empty tide, including sub-minimum ones).
    */
@@ -1141,7 +1221,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * and the boundary value is the exact k-th largest count selected within
    * it (quickselect over the packed values, see {@link #selectBoundary}).
    * Reused across tides instead of allocated per tide (the deliverer is
-   * the only writer).  Zeroed with {@link Arrays#fill} at the start of
+   * the only writer). Zeroed with {@link Arrays#fill} at the start of
    * each promotion pass.
    */
   private final int[] histogram = new int[HISTOGRAM_BUCKETS];
@@ -1155,7 +1235,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * The quickselect partitions THIS view (index swaps, never the packed
    * arrays), so the (value, hash) pairing in {@link #allValues} /
    * {@link #allHashes} survives for the incumbent split and the promotion
-   * scans.  Cleared implicitly via the pass-local bucket-size counter
+   * scans. Cleared implicitly via the pass-local bucket-size counter
    * (stale tail entries are never read).
    */
   private int[] bucketIdx = new int[SCAN_ARRAY_INITIAL_CAPACITY];
@@ -1165,14 +1245,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@link #bucketIdx}): packed-array indices (into {@link #allValues}) of
    * every key at or above the previous tide's exact boundary
    * ({@link #lastKth}), collected in the histogram sweep — one extra
-   * comparison per snapshot entry.  When the list holds at least
+   * comparison per snapshot entry. When the list holds at least
    * {@link #hotLimit} keys, {@link #selectBoundary} selects the exact k-th
    * largest over THIS
    * list (quickselect + the {@code >= kth} count) instead of the
    * boundary-bucket view: the list provably contains every key that can
    * rank in the top {@code hotLimit} (see the method's Javadoc for the
    * lemma), so stable workloads skip the in-bucket selection whose size is
-   * the bucket, not the boundary.  Cleared implicitly via the pass-local
+   * the bucket, not the boundary. Cleared implicitly via the pass-local
    * size counter (stale tail entries are never read).
    */
   private int[] aboveKthIdx = new int[SCAN_ARRAY_INITIAL_CAPACITY];
@@ -1181,16 +1261,18 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Promotion candidate index list, reused across tides instead of allocated
    * per tide (the deliverer is the only writer): packed-array indices (into
    * {@link #allValues} / {@link #allHashes}) of the keys at or above the
-   * floor, collected in the histogram sweep.  Cleared at the start of each
+   * floor, collected in the histogram sweep. Cleared at the start of each
    * promotion pass and only read within the same pass, so stale entries from
    * a skipped pass are never observed.
    *
-   * <p>Index views instead of entry lists: the split and the promotion scan
+   * <p>
+   * Index views instead of entry lists: the split and the promotion scan
    * need only the value (the threshold test) and the cached hash (the beacon
    * tests) — both already packed in {@link #allValues} / {@link #allHashes} —
-   * never the key itself.  Each value and hash lives in exactly one copy.
+   * never the key itself. Each value and hash lives in exactly one copy.
    *
-   * <p>Grown on demand by the sweep and opportunistically shrunk by
+   * <p>
+   * Grown on demand by the sweep and opportunistically shrunk by
    * {@link #shrinkScanArrays(int)} after a cardinality spike (the lifecycle
    * the other views share).
    */
@@ -1201,13 +1283,13 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * (deliverer-only, reused like {@link #candidateIdx}): the beacon members
    * captured BEFORE the halving decay sweep — the only memory of who was
    * hot last tide, since the decay zeroes the evidence of every member on a
-   * saturated set's decay tide.  The split from the newcomers happens in
+   * saturated set's decay tide. The split from the newcomers happens in
    * {@link #selectBoundary} on the exact cutoff (one membership test per
-   * candidate with {@code v >= kth}).  The two-pass scan re-promotes exactly
+   * candidate with {@code v >= kth}). The two-pass scan re-promotes exactly
    * these keys first
    * (renewals before newcomers), so the capacity break can never evict a
    * renewing key and the hot set stays stable under flat distributions where
-   * the boundary tie-band is wider than the remaining slots.  The indices
+   * the boundary tie-band is wider than the remaining slots. The indices
    * reference the packed arrays — no extra key retention beyond the tide.
    */
   private int[] incumbentIdx = new int[SCAN_ARRAY_INITIAL_CAPACITY];
@@ -1216,10 +1298,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Newcomer index snapshot for the fill pass (deliverer-only, reused like
    * {@link #incumbentIdx}): the candidates that were NOT beacon members
    * before the halving decay, split from the incumbents in the same
-   * {@link #selectBoundary} pass.  Pass 2 iterates exactly this list,
+   * {@link #selectBoundary} pass. Pass 2 iterates exactly this list,
    * so no membership re-test is needed there: the split is decided once,
    * pre-decay, and pass 1 re-promotes every qualifying incumbent, so no
-   * newcomer can already be a member when pass 2 runs.  Only
+   * newcomer can already be a member when pass 2 runs. Only
    * read within the same overflow pass, so stale entries from a skipped pass
    * are never observed.
    */
@@ -1231,36 +1313,39 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * or above this value into {@link #aboveKthIdx}, and
    * {@link #selectBoundary} takes the exact selection over that list when
    * it provably holds this cycle's k-th largest — stable workloads skip
-   * the in-bucket quickselect entirely.  {@code -1} = no previous boundary
+   * the in-bucket quickselect entirely. {@code -1} = no previous boundary
    * yet (the first scan tide pays the full path; a stale value never
    * affects correctness — it merely widens or narrows the filter, see the
-   * method's Javadoc).  Deliverer-only; retained across {@link #clear()}
+   * method's Javadoc). Deliverer-only; retained across {@link #clear()}
    * like the governor floor (an adaptive reference, never correctness).
    */
   private long lastKth = -1;
 
   /**
    * Packed per-key (value, hash) snapshot arrays, reused across tides instead
-   * of allocated per tide (the deliverer is the only writer).  Filled in the
+   * of allocated per tide (the deliverer is the only writer). Filled in the
    * same single sweep as {@link #histogram} for EVERY snapshot entry —
    * including {@code v <= 0} members, which the floor filter below skips but
    * the saturated branch needs (a stale-squatting member reads 0 this tide),
    * so the packing happens BEFORE the filter.
    *
-   * <p>The saturated branch (see {@link #promote(Map, long)}) re-visits the whole
+   * <p>
+   * The saturated branch (see {@link #promote(Map, long)}) re-visits the whole
    * snapshot to count renewals and member earnings; the packed arrays give
    * it a tight two-array scan with the pass-1 hashes — one
-   * {@code mixHash} per key per tide, never a re-avalanche.  The values are
+   * {@code mixHash} per key per tide, never a re-avalanche. The values are
    * stored because the branch needs them per key (two sequential arrays read
    * in lockstep — better locality than dereferencing the snapshot's own
    * {@code Map.Entry} nodes).
    *
-   * <p>The packed arrays are also the data mother of the index views
+   * <p>
+   * The packed arrays are also the data mother of the index views
    * ({@link #candidateIdx} / {@link #incumbentIdx} / {@link #newcomerIdx}):
    * a view holds only packed indices, so the value and the hash are read
    * from this single copy instead of from per-view duplicates.
    *
-   * <p>Deliverer-only, grown by doubling like {@link #candidateIdx},
+   * <p>
+   * Deliverer-only, grown by doubling like {@link #candidateIdx},
    * opportunistically shrunk by {@link #shrinkScanArrays(int)} after a
    * cardinality spike, and cleared implicitly via the pass-local
    * packed-size counter (stale tail entries are never read).
@@ -1272,32 +1357,32 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
   public WaveCounter(Consumer<Map<String, Long>> batchConsumer) {
     this(
-      batchConsumer,
-      DEFAULT_MAX_OPCOUNT,
-      0L, // ignored: the deprecated flush-clock default (DEFAULT_FLUSH_INTERVAL_MS) is API-compat only
-      DEFAULT_DELIVER_INTERVAL_MS,
-      DEFAULT_HOT_LIMIT,
-      true,
-      null
-    );
+        batchConsumer,
+        DEFAULT_MAX_OPCOUNT,
+        0L, // ignored: the deprecated flush-clock default (DEFAULT_FLUSH_INTERVAL_MS) is
+            // API-compat only
+        DEFAULT_DELIVER_INTERVAL_MS,
+        DEFAULT_HOT_LIMIT,
+        true,
+        null);
   }
 
   public WaveCounter(Consumer<Map<String, Long>> batchConsumer, ScheduledExecutorService scheduler) {
     this(
-      batchConsumer,
-      DEFAULT_MAX_OPCOUNT,
-      0L, // ignored: the deprecated flush-clock default (DEFAULT_FLUSH_INTERVAL_MS) is API-compat only
-      DEFAULT_DELIVER_INTERVAL_MS,
-      DEFAULT_HOT_LIMIT,
-      false,
-      scheduler
-    );
+        batchConsumer,
+        DEFAULT_MAX_OPCOUNT,
+        0L, // ignored: the deprecated flush-clock default (DEFAULT_FLUSH_INTERVAL_MS) is
+            // API-compat only
+        DEFAULT_DELIVER_INTERVAL_MS,
+        DEFAULT_HOT_LIMIT,
+        false,
+        scheduler);
   }
 
   /**
    * Compatibility constructor mirroring the deprecated
    * {@link BufferedCounter} 5-arg shape so existing call sites (e.g.
-   * {@code KeyReporterImpl}) compile unchanged.  The eager-swap
+   * {@code KeyReporterImpl}) compile unchanged. The eager-swap
    * ratio is a concept of the double-buffer design and is ignored here;
    * the capacity is wired as a <em>soft</em> cap on the cold-path
    * reservoir: once the shared table reaches it (plus a 10% overshoot
@@ -1306,31 +1391,30 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * keep counting. The cap is approximate (racy size check) — it bounds
    * memory, not exactness.
    *
-   * @param batchConsumer     downstream consumer of merged snapshots
-   * @param capacity          max distinct cold keys per delivery cycle;
-   *                          {@code <= 0} means unbounded
-   * @param flushIntervalMs   retained for API compatibility — ignored
-   *                          (the flush-clock discharge was removed; the
-   *                          tide loop is the low-traffic fallback)
-   * @param ignoredSwapRatio  ignored (no eager-swap in this design)
-   * @param scheduler         scheduler for the periodic flusher (not shut down by this instance)
+   * @param batchConsumer    downstream consumer of merged snapshots
+   * @param capacity         max distinct cold keys per delivery cycle;
+   *                         {@code <= 0} means unbounded
+   * @param flushIntervalMs  retained for API compatibility — ignored
+   *                         (the flush-clock discharge was removed; the
+   *                         tide loop is the low-traffic fallback)
+   * @param ignoredSwapRatio ignored (no eager-swap in this design)
+   * @param scheduler        scheduler for the periodic flusher (not shut down by
+   *                         this instance)
    */
   public WaveCounter(
-    Consumer<Map<String, Long>> batchConsumer,
-    int capacity,
-    long flushIntervalMs,
-    double ignoredSwapRatio,
-    ScheduledExecutorService scheduler
-  ) {
+      Consumer<Map<String, Long>> batchConsumer,
+      int capacity,
+      long flushIntervalMs,
+      double ignoredSwapRatio,
+      ScheduledExecutorService scheduler) {
     this(
-      batchConsumer,
-      DEFAULT_MAX_OPCOUNT,
-      flushIntervalMs,
-      DEFAULT_DELIVER_INTERVAL_MS,
-      DEFAULT_HOT_LIMIT,
-      false,
-      scheduler
-    );
+        batchConsumer,
+        DEFAULT_MAX_OPCOUNT,
+        flushIntervalMs,
+        DEFAULT_DELIVER_INTERVAL_MS,
+        DEFAULT_HOT_LIMIT,
+        false,
+        scheduler);
     this.capacity = Math.max(0, capacity);
     this.capacityHeadroom = this.capacity / 10;
   }
@@ -1338,14 +1422,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Compatibility constructor that additionally wires the delivery cadence.
    *
-   * <p>Unlike the 5-arg variant (whose {@code flushIntervalMs} is retained for
+   * <p>
+   * Unlike the 5-arg variant (whose {@code flushIntervalMs} is retained for
    * API compatibility and ignored), this constructor passes
    * {@code deliverIntervalMs} through to the tide loop, so callers such as
    * {@code KeyReporterImpl} can honor their configured report interval
    * ({@code zeta.local.report-interval-ms}, default 50ms) instead of the
    * 500ms adaptive default. Idle cycles stay at {@code deliverIntervalMs};
    * backlog pressure still shortens the cycle down to
-   * {@link #EARLY_TIDE_MIN_INTERVAL_MS}.  Values below that floor are clamped
+   * {@link #EARLY_TIDE_MIN_INTERVAL_MS}. Values below that floor are clamped
    * up to it — the scheduler enforces the floor on every fire regardless, so
    * a smaller setting only desynchronized the interval the governor's rate
    * normalization sees from the cadence actually scheduled.
@@ -1355,17 +1440,17 @@ public class WaveCounter implements InitializingBean, Destroyable {
    *                          {@code <= 0} means unbounded
    * @param flushIntervalMs   retained for API compatibility — ignored
    * @param ignoredSwapRatio  ignored (no eager-swap in this design)
-   * @param scheduler         scheduler for the periodic flusher (not shut down by this instance)
+   * @param scheduler         scheduler for the periodic flusher (not shut down by
+   *                          this instance)
    * @param deliverIntervalMs base delivery cadence of the tide loop
    */
   public WaveCounter(
-    Consumer<Map<String, Long>> batchConsumer,
-    int capacity,
-    long flushIntervalMs,
-    double ignoredSwapRatio,
-    ScheduledExecutorService scheduler,
-    long deliverIntervalMs
-  ) {
+      Consumer<Map<String, Long>> batchConsumer,
+      int capacity,
+      long flushIntervalMs,
+      double ignoredSwapRatio,
+      ScheduledExecutorService scheduler,
+      long deliverIntervalMs) {
     this(batchConsumer, DEFAULT_MAX_OPCOUNT, flushIntervalMs, deliverIntervalMs, DEFAULT_HOT_LIMIT, false, scheduler);
     this.capacity = Math.max(0, capacity);
     this.capacityHeadroom = this.capacity / 10;
@@ -1374,28 +1459,26 @@ public class WaveCounter implements InitializingBean, Destroyable {
   @SuppressWarnings("java:S107")
   // 8 constructor params: batch geometry + delivery + lifecycle, all required
   private WaveCounter(
-    Consumer<Map<String, Long>> batchConsumer,
-    int opMaxCount,
-    long ignoredFlushIntervalMs,
-    long deliverIntervalMs,
-    int hotLimit,
-    boolean ownsScheduler,
-    ScheduledExecutorService scheduler
-  ) {
+      Consumer<Map<String, Long>> batchConsumer,
+      int opMaxCount,
+      long ignoredFlushIntervalMs,
+      long deliverIntervalMs,
+      int hotLimit,
+      boolean ownsScheduler,
+      ScheduledExecutorService scheduler) {
     // (parameter validation): the local map's open-addressing probe must
     // never fill — the batch trigger discharges at opMaxCount, so at most
     // that many slots are claimed, and LOCAL_CAPACITY / 2 keeps the probe
     // distance bounded at a full batch (a claim for a new key past that
-    // point would loop forever over occupied slots).  hotLimit is capped so
+    // point would loop forever over occupied slots). hotLimit is capped so
     // the beacon room space (hotLimit * 32) stays within a positive-int
     // power of two — beyond 2^30 rooms the sizing loop overflows to a
     // negative mask and mis-indexes the array.
     if (opMaxCount <= 0 || opMaxCount > LOCAL_CAPACITY / 2) {
       throw new IllegalArgumentException(
-        "opMaxCount must be in (0, " +
-          (LOCAL_CAPACITY / 2) +
-          "] so the open-addressing probe can never fill the local map"
-      );
+          "opMaxCount must be in (0, " +
+              (LOCAL_CAPACITY / 2) +
+              "] so the open-addressing probe can never fill the local map");
     }
     if (hotLimit < 0 || hotLimit > MAX_HOT_LIMIT) {
       throw new IllegalArgumentException("hotLimit must be in [0, " + MAX_HOT_LIMIT + "]");
@@ -1429,7 +1512,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     this.beaconMask = (int) (beaconBitCount - 1);
     // hotLimit == 0 would allocate a 0-length array (beaconBitCount == 1),
     // turning every count() into an ArrayIndexOutOfBoundsException on the
-    // first roleGet.  Clamp to one long: an empty beacon reads as 0 in
+    // first roleGet. Clamp to one long: an empty beacon reads as 0 in
     // every room, so every key routes cold — the exact semantics of "no
     // hot set" (the promotion scan is gated by `promoted < hotLimit`, so
     // nothing is ever promoted either).
@@ -1439,28 +1522,30 @@ public class WaveCounter implements InitializingBean, Destroyable {
     this.beacon = new long[Math.toIntExact(Math.max(1, beaconBitCount >>> 4))]; // 4 bits per room (2+2 roles)
     this.ownsScheduler = ownsScheduler;
     this.scheduler = ownsScheduler
-      ? new SafeScheduledExecutorService(1, new ZetaThreadFactory("zeta-hot-route-counter-flusher"))
-      : scheduler;
+        ? new SafeScheduledExecutorService(1, new ZetaThreadFactory("zeta-hot-route-counter-flusher"))
+        : scheduler;
   }
 
   /**
    * Record one or more accesses for the given key.
    *
-   * <p><b>Routing:</b> the writer's last-key cache (a thread-private
+   * <p>
+   * <b>Routing:</b> the writer's last-key cache (a thread-private
    * pointer test, see {@link Ceils#tryFastAdd}) is consulted first — a
    * repeated add of the same key instance is fully handled without the
    * beacon — and only a miss falls through to the
-   * {@link #isBeaconMember(int, int)} membership test (~3-10ns) that picks the path.
+   * {@link #isBeaconMember(int, int)} membership test (~3-10ns) that picks the
+   * path.
    * <ul>
-   *   <li><b>Hot path</b> — add into the thread-local map (zero shared
-   *       access), and every {@code opMaxCount} merges bulk-add into the
-   *       shared table (low-traffic residuals are drained by each tide
-   *       instead — the flush-clock discharge was removed, see
-   *       {@link #DEFAULT_FLUSH_INTERVAL_MS}).  Hot keys see the
-   *       shared table once per batch instead of once per increment.</li>
-   *   <li><b>Cold path</b> — direct lock-free {@code ConcurrentHashMap}
-   *       write: the cheapest possible path, no local layer, no per-op
-   *       protection (see the class doc for the approximate window).</li>
+   * <li><b>Hot path</b> — add into the thread-local map (zero shared
+   * access), and every {@code opMaxCount} merges bulk-add into the
+   * shared table (low-traffic residuals are drained by each tide
+   * instead — the flush-clock discharge was removed, see
+   * {@link #DEFAULT_FLUSH_INTERVAL_MS}). Hot keys see the
+   * shared table once per batch instead of once per increment.</li>
+   * <li><b>Cold path</b> — direct lock-free {@code ConcurrentHashMap}
+   * write: the cheapest possible path, no local layer, no per-op
+   * protection (see the class doc for the approximate window).</li>
    * </ul>
    *
    * @param key   the accessed key ({@code null} and empty keys are
@@ -1478,14 +1563,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
     // (last-key cache first): the thread-private fast add precedes the
     // beacon routing — a repeated add of the SAME key instance (the common
     // hot-key pattern, see {@link Ceils#tryFastAdd}) is handled here
-    // without paying the beacon's two array loads and rehash (~3-5ns).  The
+    // without paying the beacon's two array loads and rehash (~3-5ns). The
     // cache can only reference a key that previously took the hot path (a
     // claim is the only way a slot changes keys, and claims only happen on
     // the routed hot path), so a hit is a hot-key add by construction; a
     // key whose beacon evidence decayed out of the hot set still lands its
     // counts in the shared table exactly (the 0-return recovery merges into
     // the current table like the cold path), so the stale route is bounded
-    // by the next drain and never loses or double-counts.  Cold-only
+    // by the next drain and never loses or double-counts. Cold-only
     // workloads pay one ThreadLocalMap miss-get instead of the beacon test
     // (a wash); hot workloads save the beacon read on every repeated-key
     // op.
@@ -1502,7 +1587,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // writers never contend on the same shared entry.
         if (m == null) {
           // First hot count from this writer: register its local map so the
-          // deliverer can add residuals if the thread dies (isAlive).  The
+          // deliverer can add residuals if the thread dies (isAlive). The
           // map is claimed from the dead-writer pool when available instead
           // of allocated (see {@link #ceilPool}) — per-request-thread
           // deployments would otherwise allocate a ~7KB map per request.
@@ -1519,23 +1604,31 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
         m.add(key, delta, h);
       } else {
-        // The cheapest possible path (plain CHM increment).  A cold writer
+        // The cheapest possible path (plain CHM increment). A cold writer
         // that captured the table reference just before the tide swap may
         // write into the old table after the snapshot; the tide/destroy 1ms
         // quiescence window bounds this to a preemption > 1ms (see class doc).
-        LongAdder cell = reservoir.get(key);
+        // The shared-table reference is captured once into a local: the miss
+        // branch's mergeKey must target the SAME table the get() probed, and
+        // a second volatile read of the field could observe the tide's swap
+        // in between — landing the insert in a different table than the one
+        // the membership check ran against. One volatile read instead of two
+        // also drops a per-miss acquire on weak memory models (AArch64:
+        // ldar → ldr for the cached local); a no-op on x86 (TSO).
+        ConcurrentHashMap<String, LongAdder> table = reservoir;
+        LongAdder cell = table.get(key);
         if (cell == null) {
           // Soft capacity guard: only NEW keys at capacity are dropped —
           // keys already tracked keep counting, so the bound limits memory
-          // (key cardinality) without biasing established counters.  The
+          // (key cardinality) without biasing established counters. The
           // guard is paid only on the miss branch (get() returned null), so
           // the steady-state hit path is a single table lookup plus a
-          // striped add.  The capacity test uses the O(1) approximateSize
+          // striped add. The capacity test uses the O(1) approximateSize
           // instead of ConcurrentHashMap.size() (O(cores) counter-cell reads
           // per miss); the get() above doubles as the membership check — a
           // key inserted by another thread between the two reads at the
           // capacity boundary is inside the documented "approximate (racy
-          // size check)" semantics.  Keeping the guard BEFORE the flag/insert
+          // size check)" semantics. Keeping the guard BEFORE the flag/insert
           // keeps the dominant drop path at one get + one atomic read.
           if (capacity > 0 && (long) APPROXIMATE_SIZE.getOpaque(this) >= capacity + capacityHeadroom) {
             return;
@@ -1543,17 +1636,17 @@ public class WaveCounter implements InitializingBean, Destroyable {
           // (quiescence-gate): a cold writer that may land in the CURRENT
           // table marks the flag BEFORE its insert; the tide clears it at
           // swap and skips the 1ms quiescence window on cycles where no
-          // cold writer was in flight (see the field doc).  A dropped key
+          // cold writer was in flight (see the field doc). A dropped key
           // never reaches this store — only real writes mark the flag.
           // Read-gated: the flag is monotonic within a cycle, so only the
           // first cold first-insert pays the store (see the field doc).
           // First insert: two-phase steal + putIfAbsent (see mergeKey) —
           // computeIfAbsent's mapping closure would allocate per real
-          // first-insert (GC pressure under key churn).  A zeroed adder that
+          // first-insert (GC pressure under key churn). A zeroed adder that
           // loses the putIfAbsent race to another thread is discarded (a
-          // 24-byte object).  The approximate-size increment is exactly-once:
+          // 24-byte object). The approximate-size increment is exactly-once:
           // putIfAbsent's winner is the one real insert.
-          cell = mergeKey(reservoir, ebbReservoir, key, delta, true);
+          cell = mergeKey(table, ebbReservoir, key, delta, true);
         } else {
           cell.add(delta);
         }
@@ -1576,21 +1669,24 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Caffeine's {@code FrequencySketch.spread} — hash-prospector's
    * {@code triple32} first two rounds (xorshift-multiply-xorshift).
    *
-   * <p>Mixes {@link String#hashCode()} so that keys whose hashes cluster on
+   * <p>
+   * Mixes {@link String#hashCode()} so that keys whose hashes cluster on
    * the low bits (e.g. short numeric suffixes) spread evenly across the
    * writer-private local map's slots, instead of degrading the hot path's
-   * open-addressing probes into long runs.  Cost is a few integer ops
+   * open-addressing probes into long runs. Cost is a few integer ops
    * (~1-2 ns) on the hot path.
    *
-   * <p>Same construction and cost as the MurmurHash3 32-bit finalizer it
+   * <p>
+   * Same construction and cost as the MurmurHash3 32-bit finalizer it
    * replaces, with a strictly better avalanche: hash-prospector's
    * two-round functions of this shape already beat Murmur3's finalizer,
    * and this prefix scores ~0.021 on its estimate — near the theoretical
-   * limit.  The k=2 beacon's {@link #rehash(int)} is triple32's third
+   * limit. The k=2 beacon's {@link #rehash(int)} is triple32's third
    * round, so {@code mixHash + rehash} is exactly the full triple32 — the
    * same hash family Caffeine's sketch derives its positions from.
    *
-   * <p>Note: this defends against <em>distribution</em> attacks (low-bit
+   * <p>
+   * Note: this defends against <em>distribution</em> attacks (low-bit
    * clustering), not against deliberately equal hash codes — identical
    * {@code hashCode()} values still map identically, which is the same
    * defense level as {@code ConcurrentHashMap}'s own spread.
@@ -1618,7 +1714,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * uniformly distributed and independent of the first — the k=2
    * false-positive math is unchanged.
    *
-   * <p>This is exactly triple32's third round, so together with
+   * <p>
+   * This is exactly triple32's third round, so together with
    * {@link #mixHash} (its first two rounds) the pair is the complete
    * hash-prospector {@code triple32}.
    *
@@ -1633,9 +1730,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
   // The compact beacon packs 4-bit rooms into 64-bit longs (16 rooms per
   // long): low 2 bits = bit1 role evidence, high 2 bits = bit2 role
-  // evidence.  Each role needs only 2 bits (saturating at 3): the
+  // evidence. Each role needs only 2 bits (saturating at 3): the
   // first-promotion seed of 2 plus the halving decay (swept on every
-  // other promoted tide, ADR-0049) yields the 4-tide memory.  The
+  // other promoted tide, ADR-0049) yields the 4-tide memory. The
   // deliverer is the only writer, so the read-modify-write helpers below
   // need no CAS.
 
@@ -1646,12 +1743,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
   private static final int BIT2_OFFSET = 2;
 
   /**
-   * Halving-decay shift for a 2-bit role evidence.  In this
+   * Halving-decay shift for a 2-bit role evidence. In this
    * encoding only 1 is meaningful: a shift of 2 or more zeroes every lane
    * (values 0-3 right-shifted by >= 2), and the SWAR identity in
    * {@link #decayCounts()} — a lane's high bit moved to its low position —
    * holds exactly for shift 1, because the shifted bit must land within
-   * its own 2-bit lane.  A different effective decay RATE is the sweep
+   * its own 2-bit lane. A different effective decay RATE is the sweep
    * cadence, not this shift: the sweep runs on every
    * {@link #DECAY_PERIOD}-th promoted tide instead (see
    * {@link #sweepCountdown}, ADR-0049), keeping this shift and its SWAR
@@ -1662,26 +1759,28 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Initial evidence value when a key is first promoted into the routing beacon.
    *
-   * <p>A seed of {@code 2} (not {@code 1}) together with the halving decay,
+   * <p>
+   * A seed of {@code 2} (not {@code 1}) together with the halving decay,
    * swept on every other promoted tide (ADR-0049), yields a <em>four-tide</em>
    * memory window: a freshly promoted hot key is written as {@code 2}, survives
    * two quiet tides unchanged, decays to {@code 1} (still satisfies the
    * membership test), survives one more quiet tide, and decays to {@code 0} on
-   * the following sweep, automatically leaving the beacon.  The hysteresis
+   * the following sweep, automatically leaving the beacon. The hysteresis
    * prevents ping-pong eviction/re-promotion across quiet cycles — up to three
    * of them — while the 4-tide bound keeps the hot set responsive to workload
    * shifts.
    *
-   * <p>This value is used only for path‑routing decisions; it is never added to
+   * <p>
+   * This value is used only for path‑routing decisions; it is never added to
    * the actual per‑key counter.
    */
   private static final int INIT_COUNT = 2;
   /**
    * SWAR decay mask: the high bit of every 2-bit field
-   * (positions {@code 4r+1} / {@code 4r+3}).  A halving decay of a
+   * (positions {@code 4r+1} / {@code 4r+3}). A halving decay of a
    * 2-bit lane is exactly "move the high bit to the low position", so
    * {@code (word & this) >>> DECAY_SHIFT} decays the whole word
-   * bit-parallel.  Tied to {@link #DECAY_SHIFT} == 1 — the mask must
+   * bit-parallel. Tied to {@link #DECAY_SHIFT} == 1 — the mask must
    * select the bit that lands at each lane's low position after the
    * shift.
    */
@@ -1689,7 +1788,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
   /**
    * SWAR active mask: the count-evidence lanes of the
-   * DECAYED word (positions {@code 4r}).  A room is active after decay
+   * DECAYED word (positions {@code 4r}). A room is active after decay
    * iff its original count evidence was ≥ 2 (high bit set), which lands
    * on bit {@code 4r} of {@code (word & DECAY_HIGH_BITS_MASK) >>> DECAY_SHIFT}.
    * Trace lanes (positions {@code 4r+2}) are excluded — active counts
@@ -1700,7 +1799,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Read the 2-bit role evidence at the given offset of the room.
    *
-   * <p>A plain array load (see the field doc — best-effort visibility,
+   * <p>
+   * A plain array load (see the field doc — best-effort visibility,
    * routing-only; never correctness).
    *
    * @param bit    the global room index (0‑based, masked by {@link #beaconMask})
@@ -1718,15 +1818,17 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Whether the key is a promoted hot key (hot-path routing check) at the
    * given evidence floor.
    *
-   * <p>Two independent role evidences, both required: the bit1-role
+   * <p>
+   * Two independent role evidences, both required: the bit1-role
    * evidence at the first hash room AND the bit2-role evidence at the
-   * second hash room, each {@code >= minEvidence}.  A promoted key always
+   * second hash room, each {@code >= minEvidence}. A promoted key always
    * writes both (no false negatives); false positives need both a
    * polluted count room AND a polluted trace room (the k=2 point), and are
    * routing-only.
    *
-   * <p>The floor is {@code 1} on the routing path and in the promotion
-   * split (any live evidence makes a member).  The ADR-0045 §IV
+   * <p>
+   * The floor is {@code 1} on the routing path and in the promotion
+   * split (any live evidence makes a member). The ADR-0045 §IV
    * phase-normalized governor reading raises it to {@code 2} — the
    * decay-equivalent membership, exactly the set a halving decay would
    * leave behind (post-decay evidence {@code >= 1} {@code <=>} pre-decay
@@ -1754,15 +1856,16 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Promote a key into the routing beacon (deliverer thread only).
    *
-   * <p>The ACTIVE hot set (rooms whose bit1-role evidence transitions
+   * <p>
+   * The ACTIVE hot set (rooms whose bit1-role evidence transitions
    * 0 → 2) gates the promotion scan, refreshed by the tide's halving
    * sweep — a decayed-away key frees its slot, so the hot set never
-   * freezes at capacity.  The deliverer is the only writer, so the
+   * freezes at capacity. The deliverer is the only writer, so the
    * read-modify-write needs no CAS.
    *
-   * @param h   the avalanched key hash ({@code mixHash(key.hashCode())}),
-   *            computed once by the promotion sweep and cached — the caller
-   *            never recomputes it
+   * @param h the avalanched key hash ({@code mixHash(key.hashCode())}),
+   *          computed once by the promotion sweep and cached — the caller
+   *          never recomputes it
    * @return {@code true} if the key became newly active (count room
    *         evidence 0 → 2)
    */
@@ -1778,18 +1881,18 @@ public class WaveCounter implements InitializingBean, Destroyable {
     int t = roleGet(bit2, BIT2_OFFSET);
     // Per-field saturation guard: each role evidence is
     // refreshed independently — a room saturated (3) by OTHER keys'
-    // evidence must not block this key's own field.  First promotion
+    // evidence must not block this key's own field. First promotion
     // seeds 2 (not 1): with the every-other-tide sweep (ADR-0049), a
     // seed of 1 would leave the hot set after a single quiet tide;
     // seeding 2 gives the 4-tide memory (tolerates up to three quiet
-    // cycles without ping-pong).  The value is a memory mark, not a
+    // cycles without ping-pong). The value is a memory mark, not a
     // literal promotion count.
     int delta1 = c < 3 ? (c == 0 ? INIT_COUNT : 1) : 0;
     int delta2 = t < 3 ? (t == 0 ? INIT_COUNT : 1) : 0;
     roleAdds(bit1, bit2, delta1, delta2);
 
     // Newly active = the count room transitioned 0 → 2 (a fresh slot in
-    // the decayCounts() budget).  The guard above always writes when
+    // the decayCounts() budget). The guard above always writes when
     // c == 0, so the return is exact in every branch.
     return c == 0;
   }
@@ -1797,13 +1900,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Add independent deltas to the two role evidences of a promotion.
    *
-   * <p><b>(merged read-modify-write).</b>  When both evidences share the
+   * <p>
+   * <b>(merged read-modify-write).</b> When both evidences share the
    * same long (1/2048 of promotions — the two room indices fall in the
-   * same 16-room long only when {@code bit1 >>> 4 == bit2 >>> 4}), the word is loaded once, both fields
+   * same 16-room long only when {@code bit1 >>> 4 == bit2 >>> 4}), the word is
+   * loaded once, both fields
    * are adjusted in registers under their own saturation guards, and
    * stored once — instead of two independent read-modify-write cycles
    * (the JIT's CSE would likely merge the accesses anyway; the branch
-   * makes it deterministic).  Deliverer-only, so no CAS.
+   * makes it deterministic). Deliverer-only, so no CAS.
    *
    * @param bit1   the bit1-role room index (masked by {@link #beaconMask})
    * @param bit2   the bit2-role room index (masked by {@link #beaconMask})
@@ -1840,13 +1945,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * halving without the re-seeding scan would strip the whole hot set
    * within two tides (evidence 2→1→0) on small workloads; see ADR-0038):
    * every 2-bit field {@code >> DECAY_SHIFT}, and fields
-   * that decay to zero free their slot.  Both roles decay on the same
+   * that decay to zero free their slot. Both roles decay on the same
    * ladder ({@link #DECAY_SHIFT} — the per-lane halving), so a member's
    * two evidences expire in lockstep (no false negatives from one
-   * outliving the other).  Also returns the active hot-set size (the
+   * outliving the other). Also returns the active hot-set size (the
    * hotLimit gate for the promotion scan).
    *
-   * <p><b>SWAR.</b>  In a 2-bit lane the decayed value is exactly the
+   * <p>
+   * <b>SWAR.</b> In a 2-bit lane the decayed value is exactly the
    * lane's high bit moved to the low position, so the whole word decays
    * with one mask-and-shift (bit-parallel, no per-room loop), and the
    * post-decay active count is the same shifted value's lane popcount.
@@ -1854,7 +1960,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@link #DECAY_HIGH_BITS_MASK} / {@link #ACTIVE_LANE_MASK} for the
    * lane layout.
    *
-   * <p>Active is counted POST-decay: a room whose count evidence was 1
+   * <p>
+   * Active is counted POST-decay: a room whose count evidence was 1
    * (decaying to 0) is free for the promotion scan this tide — counting
    * pre-decay values would over-report the active set and starve the
    * freed slot (a mini freeze-at-hotLimit, contradicting the "after
@@ -1886,22 +1993,24 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * hotLimit gate and the governor's occupancy denominator, same
    * consumers as {@link #decayCounts()}'s return).
    *
-   * <p>The floor is {@code 1} for the promotion scan gate (any live
-   * count evidence occupies a slot — the honest occupancy).  The
+   * <p>
+   * The floor is {@code 1} for the promotion scan gate (any live
+   * count evidence occupies a slot — the honest occupancy). The
    * ADR-0045 §IV phase-normalized governor reading raises it to {@code 2} —
    * the decay-equivalent basis: the post-scan evidence {@code >= 2} set,
    * exactly what a halving decay + this scan would have left
    * (re-promoted evidence-1 earners count like the decay tide's
    * activations; the saturated branch's frozen beacon IS its post-scan
-   * state).  The gate runs BEFORE the scan and the reading AFTER it, so
+   * state). The gate runs BEFORE the scan and the reading AFTER it, so
    * the two floors are paid as two separate passes — a skip tide never
    * needs both at the same beacon state.
    *
-   * <p><b>SWAR.</b>  A room's count lane is active at floor 1 iff its
+   * <p>
+   * <b>SWAR.</b> A room's count lane is active at floor 1 iff its
    * 2-bit evidence is non-zero — moving the lane's bit1 down to bit0
    * ({@code word >>> 1}) and OR-ing it back makes the lane's bit0 exactly
    * the "evidence >= 1" test; at floor 2 the shifted word alone is the
-   * "evidence >= 2" test (the lane's bit1).  Trace lanes shift into
+   * "evidence >= 2" test (the lane's bit1). Trace lanes shift into
    * positions the {@link #ACTIVE_LANE_MASK} masks out, so the count is
    * one or-shift plus a popcount per word — the same cost shape as
    * {@link #decayCounts()}, one pass per promoted tide on the deliverer.
@@ -1933,13 +2042,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Reclaim a reusable {@link LongAdder} for the given key, or allocate a
    * fresh one when no recycled adder is available.
    *
-   * <p>The pool is held behind a single {@link SoftReference} (see
+   * <p>
+   * The pool is held behind a single {@link SoftReference} (see
    * {@link #ebbReservoir}), so a referent already cleared by the GC reads
    * {@code null} — the whole pool degrades at once (all-or-nothing per
-   * cycle, rebuilt at the next tide).  The deref hands out a strong
+   * cycle, rebuilt at the next tide). The deref hands out a strong
    * reference, so the GC cannot clear the map mid-remove.
    *
-   * <p>When a recycled adder is found it is {@link LongAdder#reset()} on
+   * <p>
+   * When a recycled adder is found it is {@link LongAdder#reset()} on
    * steal: the pool guarantees only that the value was <em>consumed</em>
    * by the previous snapshot, not that it is zero — resetting clears the
    * residual (previous cycle's count and any late cold write from a writer
@@ -1975,8 +2086,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
   /**
    * Return a dead writer's fully-drained local map to the pool for reuse
-   * (see {@link #ceilPool}).  The map is {@link Ceils#reset() reset} first,
-   * clearing any phantom claim slots a mid-claim death left behind.  Only
+   * (see {@link #ceilPool}). The map is {@link Ceils#reset() reset} first,
+   * clearing any phantom claim slots a mid-claim death left behind. Only
    * the deliverer calls this (tide phase-1, after {@code drainDead} and
    * the registry reaping), so the pool-size guard is exact.
    *
@@ -1998,13 +2109,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@link #stealRecycled}), and bump the distinct-key counter exactly once on
    * the real first insert (the {@code putIfAbsent} winner).
    *
-   * <p>Shared by the cold path in {@link #count(String, long)}, the hot-path
+   * <p>
+   * Shared by the cold path in {@link #count(String, long)}, the hot-path
    * drains ({@code Ceils.waveTo}), the tag-driven reconcile and the zero-return
    * recovery — one merge protocol in one place, so the exactness argument
    * (never lost, never double-counted) lives in a single code path instead of
    * four near-identical copies.
    *
-   * <p>The merge also marks the {@link #coldWriteSeen} quiescence flag BEFORE
+   * <p>
+   * The merge also marks the {@link #coldWriteSeen} quiescence flag BEFORE
    * the {@code putIfAbsent} makes the entry visible: an entry inserted by ANY
    * path (cold miss, hot drain, reconcile, recovery) can be hit-added by a
    * cold writer, and the tide's 1ms window is gated on the flag — a hit on
@@ -2016,26 +2129,25 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@link #discharge(Ceils)}), so a swap that races an in-flight merge
    * still captures the mark.
    *
-   * @param table           the shared accumulation table (non-null)
-   * @param ebb             the adder-recycling pool (previous tide's drained
-   *                        table, possibly null)
-   * @param key             the merged key
-   * @param value           the count to merge (positive)
-   * @param markQuiescence  whether this merge may be the first insert of
-   *                        the cycle and therefore must mark
-   *                        {@link #coldWriteSeen}; hot drain sweeps pass
-   *                        {@code false} because their caller marks once
-   *                        before the sweep
+   * @param table          the shared accumulation table (non-null)
+   * @param ebb            the adder-recycling pool (previous tide's drained
+   *                       table, possibly null)
+   * @param key            the merged key
+   * @param value          the count to merge (positive)
+   * @param markQuiescence whether this merge may be the first insert of
+   *                       the cycle and therefore must mark
+   *                       {@link #coldWriteSeen}; hot drain sweeps pass
+   *                       {@code false} because their caller marks once
+   *                       before the sweep
    * @return the live cell the value was added into (the {@code putIfAbsent}
    *         winner, or the stolen/allocated cell on a first insert)
    */
   private LongAdder mergeKey(
-    ConcurrentHashMap<String, LongAdder> table,
-    SoftReference<ConcurrentHashMap<String, LongAdder>> ebb,
-    String key,
-    long value,
-    boolean markQuiescence
-  ) {
+      ConcurrentHashMap<String, LongAdder> table,
+      SoftReference<ConcurrentHashMap<String, LongAdder>> ebb,
+      String key,
+      long value,
+      boolean markQuiescence) {
     // (quiescence-gate): mark the cold-write flag BEFORE the entry becomes
     // visible — any entry inserted this cycle may be hit-added by a cold
     // writer, whose add needs the window's protection (see the field doc).
@@ -2056,12 +2168,13 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
   /**
    * Mark the quiescence gate: the shared table received a write this
-   * cycle.  Read-gated (the flag is monotonic within a cycle), so only
-   * the first mark of a cycle pays a store.
+   * cycle. Read-gated (the flag is monotonic within a cycle), so only
+   * the first mark of a cycle pays a store. Opaque read + release write
+   * (see {@link #coldWriteSeen} field doc).
    */
   private void markColdWrite() {
-    if (!coldWriteSeen) {
-      coldWriteSeen = true;
+    if (!(boolean) COLD_WRITE_SEEN.getOpaque(this)) {
+      COLD_WRITE_SEEN.setRelease(this, true);
     }
   }
 
@@ -2069,14 +2182,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Capture the shared-table reference, reserve an in-flight merge slot
    * and mark the quiescence gate — atomically, under {@link #reservoirGate}.
    *
-   * <p>The mutex makes the reference capture atomic against the deliverer's
+   * <p>
+   * The mutex makes the reference capture atomic against the deliverer's
    * wholesale swap in {@link #tideWatcher()}, so the returned table is
-   * never a table the deliverer is already snapshotting.  The in-flight
+   * never a table the deliverer is already snapshotting. The in-flight
    * reservation closes the capture-to-bump preemption window: a tide that
    * swaps after this point and then waits for {@link #mergesInFlight} sees
    * the reservation (monitor release-acquire ordering — the tide acquired
    * the same gate to swap), so it cannot snapshot the table before this
-   * merge lands.  The quiescence mark is taken under the same gate: the
+   * merge lands. The quiescence mark is taken under the same gate: the
    * entries this merge inserts may land after the swap, and cold
    * hit-writers on them need this cycle's window.
    *
@@ -2094,12 +2208,13 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Bulk-add a writer's hot local map into the shared table and reset it.
    *
-   * <p>The per-writer mutex lives inside {@link Ceils#drainInto} (the
+   * <p>
+   * The per-writer mutex lives inside {@link Ceils#drainInto} (the
    * per-map {@link ReentrantLock} — never a parameter), serializing this
-   * writer's add against the deliverer's drain of the same map.  The
+   * writer's add against the deliverer's drain of the same map. The
    * {@link #reservoirGate} mutex here makes the capture of the shared-table
    * reference atomic against the deliverer's wholesale swap, so an add
-   * never writes into a table that is already being snapshotted.  The same
+   * never writes into a table that is already being snapshotted. The same
    * capture marks the {@link #coldWriteSeen} quiescence flag (see the gate
    * block), so a swap racing this in-flight merge still pays the window
    * for cold hit-writers on the entries it inserts.
@@ -2120,10 +2235,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Tag-driven recovery merge of a writer's local map, triggered by the
    * writer's post-check in {@code Ceils#add} when a drain raced its
    * fast add (the drain's sweep or wholesale bit clear may have missed
-   * the racing entry).  Same reference-capture/reservation shape as
+   * the racing entry). Same reference-capture/reservation shape as
    * {@link #discharge}; the sweep itself is tag-driven
    * ({@link Ceils#reconcile}), so entries whose marks were wiped are
-   * still recovered.  Bounded one-tide delay, never loss, never double.
+   * still recovered. Bounded one-tide delay, never loss, never double.
    */
   private void reconcile(Ceils m) {
     // (capture+reserve): same reference-capture/reservation shape as
@@ -2142,7 +2257,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * OLD reference) and the cold-write quiescence window, then drain the old
    * table into a snapshot map.
    *
-   * <p>Shared by {@link #tide()} (the periodic {@code tide}) and
+   * <p>
+   * Shared by {@link #tide()} (the periodic {@code tide}) and
    * {@link #destroy()} — both must perform the identical
    * swap-and-quiesce-and-snapshot sequence so hot-path data is exact and
    * cold-path loss stays within the documented window.
@@ -2154,7 +2270,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     ConcurrentHashMap<String, LongAdder> old;
     boolean quiesce;
     synchronized (reservoirGate) {
-      //  (rotate-table): swap the shared table wholesale.  New hot
+      // (rotate-table): swap the shared table wholesale. New hot
       // merges and cold direct writes now target the fresh table; `old`
       // becomes read-only except for writers that captured the reference
       // before the swap.
@@ -2163,26 +2279,26 @@ public class WaveCounter implements InitializingBean, Destroyable {
       reservoir = nextCapacity > 16 ? new ConcurrentHashMap<>(nextCapacity) : new ConcurrentHashMap<>();
       APPROXIMATE_SIZE.setOpaque(this, 0L);
       // (quiescence-gate): capture and clear the cold-write flag under
-      // the same mutex as the swap.  A writer that observed the OLD
+      // the same mutex as the swap. A writer that observed the OLD
       // reference and set the flag before the swap is captured here and
       // the window is paid; a writer whose flag lands after the swap
       // targets the NEW table (its computeIfAbsent re-reads the field),
       // so clearing under the gate cannot lose a write.
-      quiesce = coldWriteSeen;
-      coldWriteSeen = false;
+      quiesce = (boolean) COLD_WRITE_SEEN.getAcquire(this);
+      COLD_WRITE_SEEN.setRelease(this, false);
     }
-    //  (settle-writes): quiescence — hot merges first (exact), then
+    // (settle-writes): quiescence — hot merges first (exact), then
     // a window for cold writers preempted between reference capture and
-    // write.  The window is paid ONLY when a cold writer may be in
+    // write. The window is paid ONLY when a cold writer may be in
     // flight (coldWriteSeen was set this cycle); on cycles with no cold
     // traffic it is skipped entirely, with the residual loss window
     // shrinking to the ns-scale get-to-flag gap (see class doc).
     // Residual loss with the window paid requires a preemption > 1ms
-    // (~1e-5/op measured).  The window precedes the emptiness check so
+    // (~1e-5/op measured). The window precedes the emptiness check so
     // a writer that recovers during it can still land in the snapshot.
     int spin = SETTLE_SPIN_ITERATIONS;
     if (mergesInFlight.get() != 0) {
-      for (int check = 0; ; check++) {
+      for (int check = 0;; check++) {
         // (settle-writes): the counter is re-read on a sampling cadence —
         // get() walks the striping cells, and the 64-iteration period keeps
         // the exit delay sub-µs (the counter is zero or a bounded 256-slot
@@ -2225,17 +2341,17 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // Nothing to snapshot (idle cycle, or all traffic still resident in
       // writers' local maps): the quiescence window above was still paid —
       // an empty old table cannot be told apart from "no writer in flight"
-      // (the information gap), and the parked wait costs no CPU.  Only the
+      // (the information gap), and the parked wait costs no CPU. Only the
       // snapshot build is skipped.
       return null;
     }
     // (snapshot-promote): the old table is now quiescent — drain it.
     // Keys are unique (CHM + computeIfAbsent), so plain put is exact and
-    // skips merge's redundant per-key lookup.  Every adder's value enters
+    // skips merge's redundant per-key lookup. Every adder's value enters
     // the snapshot; the drained table ITSELF is then published as the
     // recycling pool (one SoftReference around the whole map — see
     // {@link #ebbReservoir}) — only after the last sum, so a steal can
-    // never observe unconsumed counts.  The publish replaces the previous
+    // never observe unconsumed counts. The publish replaces the previous
     // tide's pool wholesale, bounding key retention by one cycle's
     // universe, at zero per-key wrapper allocation.
     // The governor's volume signal is accumulated in the same pass (the
@@ -2287,7 +2403,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // A clear() is a full reset — zero the distinct-key counter too:
       // a stale size would make the capacity guard drop the FIRST
       // post-clear insert (a key that just cleared at the boundary is
-      // dropped although the fresh table is empty).  A writer mid-insert
+      // dropped although the fresh table is empty). A writer mid-insert
       // during clear() counted against the discarded table — its
       // increment may land after this reset and is lost, which is
       // consistent with clear() dropping everything anyway.
@@ -2296,7 +2412,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // cannot force an unnecessary window later (an in-flight writer
       // racing clear() is ns-scale; counts dropped by clear are lost
       // anyway by definition).
-      coldWriteSeen = false;
+      COLD_WRITE_SEEN.setRelease(this, false);
     }
 
     // A clear() is a full reset — drop the adder pool so no recycled
@@ -2306,7 +2422,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     // A clear() is a full reset — the routing beacon must not keep stale
     // hot routes: without this, promoted keys would keep taking the hot
     // path for up to 4 tides after the drop (the halving decay's memory,
-    // ADR-0049).  Routing-only, so the stale path was never a correctness
+    // ADR-0049). Routing-only, so the stale path was never a correctness
     // issue, but the "ready for reuse" contract should start from a blank
     // slate — including the decay sweep clock (the next promoted tide
     // decays again).
@@ -2322,38 +2438,40 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Periodic delivery scheduled by {@link #afterPropertiesSet()}.
    *
-   * <p><b>Protocol (5 phases):</b>
+   * <p>
+   * <b>Protocol (5 phases):</b>
    * <ol>
-   *   <li>{@code add-locals} — drain every registered writer's hot local
-   *       map into the shared table: live writers via {@code tryLock}
-   *       (locked maps are skipped for the cycle — their residual is
-   *       delivered by the writer's own batch discharge or the next tide,
-   *       never lost),
-   *       dead writers lock-free (thread death does not release locks).</li>
-   *   <li>{@code reap-dead} — remove dead writers' registry entries; their
-   *       residuals were just merged, so the registry cannot leak.</li>
-   *   <li>{@code rotate-table} — swap the shared table wholesale under
-   *       {@link #reservoirGate}: new merges and cold writes now target the
-   *       fresh table.</li>
-   *   <li>{@code settle-writes} — wait for {@link #mergesInFlight} to reach
-   *       zero (hot merges that captured the OLD reference have finished),
-   *       then the 1ms quiescence window for cold writers preempted between
-   *       reference capture and write (parked, not spun — see class doc;
-   *       gated by the {@code coldWriteSeen} flag: skipped only when the
-   *       shared table received no writes this cycle — its old table is
-   *       empty anyway).
-   *       Only then is the old table checked for emptiness; the window
-   *       precedes the check so a writer that recovers during it can still
-   *       land in the snapshot.</li>
-   *   <li>{@code deliver-then-promote} — snapshot the old table into a
-   *       single map, deliver it to the batch consumer, then
-   *       {@link #promote(Map, long)} the cycle's hot keys to the exact hot path
-   *       (boundary estimation, exact selection, incumbent-first scan —
-   *       see the method's Javadoc) — delivery first, so the O(n)
-   *       promotion work never adds to the consumer's latency; and tide.</li>
+   * <li>{@code add-locals} — drain every registered writer's hot local
+   * map into the shared table: live writers via {@code tryLock}
+   * (locked maps are skipped for the cycle — their residual is
+   * delivered by the writer's own batch discharge or the next tide,
+   * never lost),
+   * dead writers lock-free (thread death does not release locks).</li>
+   * <li>{@code reap-dead} — remove dead writers' registry entries; their
+   * residuals were just merged, so the registry cannot leak.</li>
+   * <li>{@code rotate-table} — swap the shared table wholesale under
+   * {@link #reservoirGate}: new merges and cold writes now target the
+   * fresh table.</li>
+   * <li>{@code settle-writes} — wait for {@link #mergesInFlight} to reach
+   * zero (hot merges that captured the OLD reference have finished),
+   * then the 1ms quiescence window for cold writers preempted between
+   * reference capture and write (parked, not spun — see class doc;
+   * gated by the {@code coldWriteSeen} flag: skipped only when the
+   * shared table received no writes this cycle — its old table is
+   * empty anyway).
+   * Only then is the old table checked for emptiness; the window
+   * precedes the check so a writer that recovers during it can still
+   * land in the snapshot.</li>
+   * <li>{@code deliver-then-promote} — snapshot the old table into a
+   * single map, deliver it to the batch consumer, then
+   * {@link #promote(Map, long)} the cycle's hot keys to the exact hot path
+   * (boundary estimation, exact selection, incumbent-first scan —
+   * see the method's Javadoc) — delivery first, so the O(n)
+   * promotion work never adds to the consumer's latency; and tide.</li>
    * </ol>
    *
-   * <p>A failure anywhere in the tide — including an {@link Error} thrown
+   * <p>
+   * A failure anywhere in the tide — including an {@link Error} thrown
    * by the consumer — is logged rate-limited (one full-stack ERROR per
    * {@value #TIDE_ERROR_LOG_WINDOW_MS}ms window, repeats one-line with the
    * suppressed count, DEBUG inside the window; see {@link #logTideFailure})
@@ -2361,7 +2479,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * consumer degrades to one log per window instead of killing delivery or
    * flooding the log.
    *
-   * <p>Phases 3-5 are delegated to {@link #tideWatcher()} (shared with
+   * <p>
+   * Phases 3-5 are delegated to {@link #tideWatcher()} (shared with
    * {@link #destroy()}).
    */
   @SuppressWarnings("all")
@@ -2369,17 +2488,17 @@ public class WaveCounter implements InitializingBean, Destroyable {
     long nextDelayMs = deliverIntervalMs;
     try {
       // (add-locals): every writer's hot local map enters the
-      // shared table.  Per-writer mutex (ReentrantLock): a live writer
+      // shared table. Per-writer mutex (ReentrantLock): a live writer
       // mid-add is tried non-blockingly — if the lock is held, this
       // writer's residual is SKIPPED for this cycle (it is delivered by
       // the writer's own batch discharge or the next tide's tryDrainInto;
       // never lost, measured 0 loss across 10 deliver-racing stress
-      // rounds).  A dead writer is
-      // drained lock-free (it can never write again — see drainDead).  The
+      // rounds). A dead writer is
+      // drained lock-free (it can never write again — see drainDead). The
       // table reference is captured ONCE before the loop: the tide is the
       // only thread that swaps the table at tide time, and the swap happens
       // later in this same thread (tideWatcher), so a single capture is
-      // equivalent to per-writer captures.  A concurrent clear() may swap
+      // equivalent to per-writer captures. A concurrent clear() may swap
       // the table mid-loop: drains then land in the discarded table and
       // their counts are dropped — consistent with clear()'s full-reset
       // contract (counts racing a clear are lost by definition).
@@ -2392,12 +2511,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
         Ceils local = entry.getValue();
 
         if (!writer.isAlive()) {
-          // Dead writer: quiescent map, no lock needed.  Reap after.
+          // Dead writer: quiescent map, no lock needed. Reap after.
           // (dead-writer drain before reap): `size` is a plain field read
           // and can lag the claim by a few ns — a stale-zero read racing
           // the writer's death would drop a just-claimed residual (the
           // occupied bit and slot writes are committed but size was not
-          // yet visible).  drainDead sweeps the occupied bitmap, which
+          // yet visible). drainDead sweeps the occupied bitmap, which
           // is the truth: an empty map costs ~4 bit checks, so draining
           // unconditionally is free at tide frequency and closes the
           // window.
@@ -2413,7 +2532,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
         if (local.size == 0) {
           // Empty local map: nothing to merge — skip the drain (spares the
-          // mergesInFlight RMWs and the 256-slot scan).  A writer that
+          // mergesInFlight RMWs and the 256-slot scan). A writer that
           // raced an add in just before this read keeps its data in the
           // local map and merges it on its own batch trigger or the next
           // tide — delayed, never lost.
@@ -2446,7 +2565,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // EMA rate (no 50<->500ms ping-pong), in-band jitter moves nothing.
         int distinctKeys = snapshot.size();
         // (tide-interval): the current snapshot accumulated over the delay
-        // the loop just slept — the PREVIOUS cadence decision.  The
+        // the loop just slept — the PREVIOUS cadence decision. The
         // governor's flood signature normalizes its volume signal by it
         // (counts/sec, comparable across cadences).
         long tideIntervalMs = nextDelayMs;
@@ -2455,10 +2574,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // BEFORE the promotion pass — the O(n) promotion work (hash
         // sweep, histogram, beacon decay, governor) must not add to the
         // delivery latency the consumer sees; the beacon state it
-        // produces only affects the NEXT cycle's routing.  The promote
+        // produces only affects the NEXT cycle's routing. The promote
         // still runs when the consumer throws (the batch is lost either
         // way — see the tide catch), so a failing consumer cannot also
-        // freeze the routing.  The consumer must not mutate the
+        // freeze the routing. The consumer must not mutate the
         // delivered map.
         try {
           batchConsumer.accept(snapshot);
@@ -2479,7 +2598,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // SafeScheduledExecutorService chain tolerance (SafePeriodicTask's
       // Throwable catch) does not apply — an uncaught Error would land in a
       // Future nobody reads (silently) and the self-reschedule below would
-      // never run, killing delivery for the process lifetime.  The rate-
+      // never run, killing delivery for the process lifetime. The rate-
       // limited log plus the finally re-arm keeps the chain alive exactly
       // like SafePeriodicTask; the rate limit stops a persistently throwing
       // consumer from emitting a full-stack ERROR every ~50ms tide.
@@ -2487,9 +2606,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
     } finally {
       // Self-rescheduling chain (one-shot schedule → tide → re-schedule),
       // routed through the coalescing pacer so a pending nudge wins when
-      // it is meaningfully earlier.  Guarded by deliveryStarted so
+      // it is meaningfully earlier. Guarded by deliveryStarted so
       // reflection-driven tides in tests never arm a background chain, and
-      // by shutdown so destroy() stops it.  Re-armed in a finally so a failed
+      // by shutdown so destroy() stops it. Re-armed in a finally so a failed
       // tide (including an Error) cannot end the chain.
       if (deliveryStarted && !((boolean) SHUTDOWN.getVolatile(this))) {
         scheduleTide(nextDelayMs);
@@ -2524,10 +2643,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
       log.error("Scheduled delivery failed", t);
     } else {
       log.error(
-        "Scheduled delivery failed again ({} failures suppressed in the previous window): {}",
-        suppressed,
-        t.toString()
-      );
+          "Scheduled delivery failed again ({} failures suppressed in the previous window): {}",
+          suppressed,
+          t.toString());
     }
   }
 
@@ -2550,19 +2668,21 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * references.
    * See ADR-0054 (supersedes the ADR-0042 sub-histogram refinement).
    *
-   * <p><b>Ordering contract.</b>  The histogram/candidate pass, the boundary
+   * <p>
+   * <b>Ordering contract.</b> The histogram/candidate pass, the boundary
    * estimation and the incumbent capture run BEFORE {@link #decayCounts()}:
    * the pre-decay beacon state is the only memory of last tide's membership
    * (the halving decay zeroes every member's evidence on a saturated set's
    * decay tide), so the renewal-first pass can only identify incumbents
-   * pre-decay.  The decay then frees decayed slots (a drifted-away key
+   * pre-decay. The decay then frees decayed slots (a drifted-away key
    * leaves within 4 non-empty tides — ADR-0049) and gates the scan on the
    * active hot-set size.
    * A snapshot below {@link #MIN_PROMOTION_KEYS} distinct keys is skipped:
    * its distribution is meaningless and promoting everything would burn
    * beacon slots on startup noise.
    *
-   * <p>Deliverer-only, called once per non-empty tide by {@link #tide()};
+   * <p>
+   * Deliverer-only, called once per non-empty tide by {@link #tide()};
    * the only per-tide result is the beacon/governor state it mutates.
    *
    * @param snapshot the just-delivered per-key counts (non-null; empty
@@ -2608,13 +2728,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@link #SCAN_ARRAY_SHRINK_FACTOR}x the current tide's need is
    * downsized to {@code max(distinctKeys, SCAN_ARRAY_INITIAL_CAPACITY)}.
    *
-   * <p><b>Why.</b>  The arrays grow by doubling/pre-sizing and previously
+   * <p>
+   * <b>Why.</b> The arrays grow by doubling/pre-sizing and previously
    * never shrank, so ONE cardinality spike (a flood of distinct keys)
    * pinned the peak footprint forever — megabytes of dead tail at the
-   * reporter's 100k-key capacity after a single spike tide.  The shrink
+   * reporter's 100k-key capacity after a single spike tide. The shrink
    * hands that tail back while keeping the reuse discipline intact.
    *
-   * <p><b>Hysteresis.</b>  The 4x band and the floor keep resize churn
+   * <p>
+   * <b>Hysteresis.</b> The 4x band and the floor keep resize churn
    * bounded: a workload must drift to 4x its working set before a copy is
    * paid (oscillating cardinality regrows into the retained slack for
    * free instead of bouncing the arrays), and a steady state at or below
@@ -2622,7 +2744,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Worst case the shrink adds one O(need) copy per scan tide on the
    * deliverer, the same cost shape as the sweep itself.
    *
-   * <p><b>Safety.</b>  Deliverer-only (the arrays are the promotion pass's
+   * <p>
+   * <b>Safety.</b> Deliverer-only (the arrays are the promotion pass's
    * exclusive state), and every consumer re-grows on demand: each pass
    * reads only its own size prefix (stale tails are never read), and the
    * sweep's growth checks run after this pass, so a shrunken array that
@@ -2664,10 +2787,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * promotion candidates (keys at or above the floor — the promote
    * condition {@code v >= max(floor, boundary)} always implies
    * {@code v >= floor}, so the candidate list is an exact filter for the
-   * promotion scan).  Every entry's (value,
+   * promotion scan). Every entry's (value,
    * hash) is packed into {@link #allValues} / {@link #allHashes} in the
    * same sweep — the saturated branch reuses them instead of re-iterating
-   * the snapshot and re-avalanching every key.  The same sweep collects
+   * the snapshot and re-avalanching every key. The same sweep collects
    * the kth-shortcut list ({@link #aboveKthIdx}: the keys at or above the
    * previous tide's exact boundary, one comparison per entry — ADR-0057).
    * The pass runs BEFORE
@@ -2716,7 +2839,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       long v = e.getValue();
       // One avalanche per key, cached for the packed arrays AND the
       // candidate index view (see {@link #candidateIdx}) — never computed
-      // twice for the same key.  Packed BEFORE the floor filter: the
+      // twice for the same key. Packed BEFORE the floor filter: the
       // saturated branch counts v <= 0 members (the stale-squatting
       // signal) and needs their hashes too.
       int h = mixHash(e.getKey().hashCode());
@@ -2736,7 +2859,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // (kth-shortcut filter, ADR-0057): collect every key at or above the
       // previous tide's exact boundary — the list {@link #selectBoundary}
       // selects over when it provably holds this cycle's k-th largest (see
-      // the method's Javadoc).  One comparison per snapshot entry, paid on
+      // the method's Javadoc). One comparison per snapshot entry, paid on
       // every scan tide; the first tide (lastKth = -1) skips the branch.
       if (lastKth >= 0 && v >= lastKth) {
         if (aboveKthIdx.length == pass.aboveKthSize) {
@@ -2793,44 +2916,47 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * bucket fits the remaining slots — replacing the ADR-0042 linear
    * 64-sub-bucket quantization and its power-of-two bucket edge.
    *
-   * <p><b>Why exact.</b>  The power-of-two edge systematically
+   * <p>
+   * <b>Why exact.</b> The power-of-two edge systematically
    * UNDERESTIMATES the true top-{@code hotLimit} cutoff ({@code kth >= 2^b}):
    * on non-overflowing tides the ADR-0042 refinement was skipped and the
    * governor's "floor above boundary" stale evidence (the flood signature,
    * the admit condition, the veto band) and the blocked band were computed
    * against a boundary lower than the honest cutoff — over-probing
    * healthy states, inflating excess, over-filtering, flicker and admit
-   * latency.  Sandbox-validated (zeta-tidal-sim {@code exact_select_campaign.py},
+   * latency. Sandbox-validated (zeta-tidal-sim {@code exact_select_campaign.py},
    * 300 paired expanded seeds + 100 legacy seeds + 26 hand scenarios):
    * every harm axis significantly better (arms/excess/floor_max/harmful
    * over-filter/flicker/admit latency, p &lt; 0.0001; hand scenarios
    * byte-identical) at the price of fewer confirms (p = 0.006) and a
    * modest deliverer-side op cost (off the hot path).
    *
-   * <p><b>Semantics (exact where ADR-0042 was quantized):</b>
+   * <p>
+   * <b>Semantics (exact where ADR-0042 was quantized):</b>
    * <ul>
-   *   <li>{@code boundary = kth}, {@code threshold = max(floor, kth)} — on
-   *       EVERY scan tide with {@code distinct >= hotLimit}; below that
-   *       the boundary is the minimum positive count, which the bucket
-   *       path reproduces automatically (the lowest non-empty bucket's
-   *       minimum IS the snapshot minimum — the ADR-0042 small-snapshot
-   *       edge, unquantized).</li>
-   *   <li>{@code blockedKeys = count(v >= kth) - count(v >= floor)} — the
-   *       keys the floor excludes that WOULD qualify at the top-k cutoff
-   *       ({@code qualifying - candSize}, one subtraction; the ADR-0042
-   *       band {@code [2^b, floor)} counted keys the cutoff excludes
-   *       anyway, inflating the admit/flood evidence).</li>
-   *   <li>{@code overflow = count(v >= kth) > hotLimit} — the tie band at
-   *       the exact cutoff wider than the capacity (the incumbent-first
-   *       gate); the incumbent/newcomer split runs on {@code v >= kth}
-   *       (the ADR-0042 split ran on the bucket edge {@code v >= 2^b}).</li>
+   * <li>{@code boundary = kth}, {@code threshold = max(floor, kth)} — on
+   * EVERY scan tide with {@code distinct >= hotLimit}; below that
+   * the boundary is the minimum positive count, which the bucket
+   * path reproduces automatically (the lowest non-empty bucket's
+   * minimum IS the snapshot minimum — the ADR-0042 small-snapshot
+   * edge, unquantized).</li>
+   * <li>{@code blockedKeys = count(v >= kth) - count(v >= floor)} — the
+   * keys the floor excludes that WOULD qualify at the top-k cutoff
+   * ({@code qualifying - candSize}, one subtraction; the ADR-0042
+   * band {@code [2^b, floor)} counted keys the cutoff excludes
+   * anyway, inflating the admit/flood evidence).</li>
+   * <li>{@code overflow = count(v >= kth) > hotLimit} — the tie band at
+   * the exact cutoff wider than the capacity (the incumbent-first
+   * gate); the incumbent/newcomer split runs on {@code v >= kth}
+   * (the ADR-0042 split ran on the bucket edge {@code v >= 2^b}).</li>
    * </ul>
    *
-   * <p><b>Kth-shortcut (ADR-0057).</b>  The sweep collects every key at or
+   * <p>
+   * <b>Kth-shortcut (ADR-0057).</b> The sweep collects every key at or
    * above the PREVIOUS tide's exact boundary ({@link #lastKth}) into
-   * {@link #aboveKthIdx} — one comparison per entry.  When that list holds
+   * {@link #aboveKthIdx} — one comparison per entry. When that list holds
    * at least {@code hotLimit} keys, the exact selection runs over the LIST
-   * instead of the bucket view.  The lemma: the shipped boundary is the
+   * instead of the bucket view. The lemma: the shipped boundary is the
    * exact {@code hotLimit}-th largest of the snapshot on every reachable
    * path — the quickselect branch by construction, the bucket-fits branch
    * because the crossing invariant (the top-down accumulation stops at the
@@ -2838,22 +2964,23 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@code bucketSize < need} unreachable, so a fitting bucket either
    * holds exactly {@code need} keys (its minimum IS the k-th largest) or
    * the snapshot holds fewer than {@code hotLimit} keys (its minimum IS
-   * the k-th largest by definition).  A list of {@code >= hotLimit} keys
+   * the k-th largest by definition). A list of {@code >= hotLimit} keys
    * above the previous boundary cannot sit below this cycle's k-th largest
    * (else fewer than {@code hotLimit} keys could qualify — contradiction),
    * so it contains every key that can rank in the top {@code hotLimit} and
    * its {@code hotLimit}-th largest IS the exact k-th largest of the
-   * snapshot.  The {@code >= kth} count over the list is the
+   * snapshot. The {@code >= kth} count over the list is the
    * whole-snapshot count (the list also holds the {@code above} keys;
-   * nothing below the kth can rank).  On
+   * nothing below the kth can rank). On
    * stable workloads the selection and the tie pass therefore scale with
    * the list (~{@code hotLimit} keys + the tie band) instead of the whole
    * boundary bucket; a drifted workload (the previous boundary above this
    * cycle's k-th largest) empties the list and falls back to the reference
-   * path, never a wrong boundary.  A stale seed only widens or narrows the
+   * path, never a wrong boundary. A stale seed only widens or narrows the
    * filter — the gate self-validates the lemma every tide.
    *
-   * <p><b>Cost.</b>  Deliverer-only: the bucket view pass (from the
+   * <p>
+   * <b>Cost.</b> Deliverer-only: the bucket view pass (from the
    * candidate view when the floor sits at or below the bucket edge — the
    * common case — so the pass scales with the candidates, not the whole
    * snapshot), a quickselect (O(bucket) expected, ~2-3n comparisons; on
@@ -2862,10 +2989,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * tie pass over the bucket view (skipped when the bucket fits: every
    * bucket key qualifies by construction), and — on overflowing tides —
    * the incumbent split (one membership test per candidate with
-   * {@code v >= kth}, see {@link #splitIncumbents}).  The quickselect
+   * {@code v >= kth}, see {@link #splitIncumbents}). The quickselect
    * partitions the bucket VIEW (index swaps), never the packed arrays, so
    * the (value, hash) pairing survives for the split and the promotion
-   * scans.  Plus the one-comparison kth filter per snapshot entry in the
+   * scans. Plus the one-comparison kth filter per snapshot entry in the
    * sweep.
    */
   @SuppressWarnings("all")
@@ -2880,7 +3007,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     if (pass.aboveKthSize >= hotLimit) {
       // (kth-shortcut, ADR-0057): the sweep collected every key at or above
       // the PREVIOUS tide's exact boundary ({@link #lastKth}) into
-      // {@link #aboveKthIdx}.  The lemma: the shipped boundary is the exact
+      // {@link #aboveKthIdx}. The lemma: the shipped boundary is the exact
       // hotLimit-th largest of the snapshot on every reachable path — the
       // quickselect branch by construction, the bucket-fits branch because
       // the crossing invariant (the top-down accumulation stops at the
@@ -2888,11 +3015,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // unreachable, so a fitting bucket either holds exactly `need` keys
       // (its minimum IS the hotLimit-th largest) or the snapshot holds
       // fewer than hotLimit keys (its minimum IS the k-th largest by
-      // definition).  A list of >= hotLimit keys above the previous
+      // definition). A list of >= hotLimit keys above the previous
       // boundary cannot sit below this cycle's k-th largest (else fewer
       // than hotLimit keys could qualify — contradiction), so it contains
       // every key that can rank in the top hotLimit and its hotLimit-th
-      // largest IS the exact k-th largest of the snapshot.  The
+      // largest IS the exact k-th largest of the snapshot. The
       // {@code >= kth} count runs over the list too: it contains the
       // `above` keys (all strictly above the kth) and nothing below the
       // kth can rank, so the count IS the whole-snapshot count — no
@@ -2909,7 +3036,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // (bucket view): the boundary-bucket keys [2^b, 2^(b+1)) — from the
       // candidates when the floor sits at or below the bucket edge, else
       // the whole packed array (keys below the floor still shape the exact
-      // k-th largest and the blocked band).  Non-positive counts cannot
+      // k-th largest and the blocked band). Non-positive counts cannot
       // match: their unsigned shift is never 1.
       boolean floorBelowBucketEdge = pass.floor <= pass.boundary;
       int bucketSize = 0;
@@ -2932,7 +3059,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       if (bucketSize > need) {
         // (exact selection): the need-th largest within the bucket IS the
         // k-th largest of the snapshot — the `above` keys in higher buckets
-        // all qualify.  Partitions the view only; the >= kth count follows
+        // all qualify. Partitions the view only; the >= kth count follows
         // (the tie band of the incumbent-first gate).
         kth = selectKthLargest(allValues, bucketIdx, 0, bucketSize - 1, need);
         bucketGe = 0;
@@ -2987,9 +3114,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Pre-decay incumbent/newcomer split (ADR-0042's incumbent-first gate,
    * now on the exact cutoff): the candidates at or above {@code kth},
    * split by last-tide membership — the capacity break never cuts a
-   * renewing key.  Runs BEFORE the halving decay: the pre-decay beacon
+   * renewing key. Runs BEFORE the halving decay: the pre-decay beacon
    * state is the only memory of last tide's membership (the decay zeroes
-   * every member's evidence on a saturated set's scan tide).  One
+   * every member's evidence on a saturated set's scan tide). One
    * membership test per qualifying candidate, decided once pre-decay:
    * pass 1 re-promotes every qualifying incumbent, so no member survives
    * to pass 2 — the fill pass never re-tests membership.
@@ -3024,8 +3151,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * expected comparisons (~2-3n), O(n^2) worst on adversarial orderings
    * (the packed values are snapshot-iteration ordered — hash-arbitrary, so
    * the middle-pivot case is the norm; the selection runs on the deliverer
-   * thread once per tide).  Only the index view is permuted — the packed
-   * arrays keep their per-key pairing.  {@code k} must satisfy
+   * thread once per tide). Only the index view is permuted — the packed
+   * arrays keep their per-key pairing. {@code k} must satisfy
    * {@code 1 <= k <= hi - lo + 1}.
    *
    * @return the k-th largest value
@@ -3036,10 +3163,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
     while (lo < hi) {
       long pivot = values[idx[(lo + hi) >>> 1]];
       int i = lo,
-        j = hi;
+          j = hi;
       while (i <= j) {
-        while (values[idx[i]] < pivot) i++;
-        while (values[idx[j]] > pivot) j--;
+        while (values[idx[i]] < pivot)
+          i++;
+        while (values[idx[j]] > pivot)
+          j--;
         if (i <= j) {
           int tmp = idx[i];
           idx[i] = idx[j];
@@ -3048,31 +3177,35 @@ public class WaveCounter implements InitializingBean, Destroyable {
           j--;
         }
       }
-      if (target <= j) hi = j;
-      else if (target >= i) lo = i;
-      else return values[idx[target]];
+      if (target <= j)
+        hi = j;
+      else if (target >= i)
+        lo = i;
+      else
+        return values[idx[target]];
     }
     return values[idx[lo]];
   }
 
   /**
    * Beacon decay gate: the halving decay runs only when the promotion
-   * scan that re-seeds evidence also runs.  On a sub-minimum snapshot
+   * scan that re-seeds evidence also runs. On a sub-minimum snapshot
    * ({@code distinctKeys < MIN_PROMOTION_KEYS}) no scan runs, so an
    * unconditional decay would strip the whole hot set within two tides
    * with nothing to renew it (evidence 2→1→0), silently routing every key
    * down the cold path for the duration of the small workload — the exact
-   * regime (few hot keys, high QPS) the hot path exists for.  Evidence
+   * regime (few hot keys, high QPS) the hot path exists for. Evidence
    * stays frozen on such tides, exactly like empty tides (ADR-0038).
    *
-   * <p>Decay sweep period (ADR-0049): the decay additionally runs only on
+   * <p>
+   * Decay sweep period (ADR-0049): the decay additionally runs only on
    * every {@link #DECAY_PERIOD}-th promoted tide — the sweep clock counts
    * down from {@link #DECAY_PERIOD} — so the same freeze protects
    * periodic earners (an earn/miss/miss key would otherwise be decayed
    * out by its second quiet tide and cold-routed on every earn tide; see
-   * {@link #countActive(int)}).  On the intervening tides only the active
+   * {@link #countActive(int)}). On the intervening tides only the active
    * size is counted and the evidence freezes; the clock advances only
-   * here, so a skipped scan freezes the sweep clock too.  The pass's
+   * here, so a skipped scan freezes the sweep clock too. The pass's
    * {@code sweepDecay} captures THIS tide's phase for the ADR-0045 §IV
    * reading (the governor's signals on a skip tide use the
    * decay-equivalent basis).
@@ -3094,9 +3227,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * earnings and the promoted-key count are computed on EVERY promoted
    * tide — including the saturated state ({@code remain >= hotLimit}),
    * where a full hot set whose members stopped earning is the governor's
-   * squatting distress signal.  Counting memberKeys POST-promotion avoids
+   * squatting distress signal. Counting memberKeys POST-promotion avoids
    * the startup artifact of a fresh beacon reading zero renewal on the
-   * very tide that promotes everyone.  The signals are bundled into one
+   * very tide that promotes everyone. The signals are bundled into one
    * {@link TideReading} and delivered to {@link #moonsTidalForce}.
    */
   @SuppressWarnings("all")
@@ -3106,7 +3239,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     // Two hot-side counters — exactly one is populated, because the
     // saturated branch excludes the scan branches: the scan branches count
     // keys PROMOTED THIS TIDE, the saturated branch counts beacon MEMBERS
-    // with live evidence (no scan ran).  Both are the "hot-side" key count
+    // with live evidence (no scan ran). Both are the "hot-side" key count
     // the density signal subtracts from distinctKeys, so they fold back
     // into one value after the branches (byte-identical arithmetic to the
     // former single promotedCount, which carried both meanings).
@@ -3114,7 +3247,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     int activeMemberCount = 0;
     // (blocked signal, ADR-0054): the blocked band [boundary, threshold)
     // is non-empty only when the floor sits above the exact k-th largest
-    // (noise traffic — the floor does the selection).  The band is the
+    // (noise traffic — the floor does the selection). The band is the
     // keys the floor excludes that WOULD qualify at the top-k cutoff,
     // computed exactly in selectBoundary (count(v >= kth) − candSize).
     int blockedKeys = pass.blockedKeys;
@@ -3126,9 +3259,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
     // at 1 and are excluded; everything else is >= 2) — so renewal,
     // hotColdRatio, the saturation gate and the empty-set collapse are
     // phase-invariant (identical on skip and decay tides, instead of
-    // oscillating with the frozen evidence).  The promotion scan gate
+    // oscillating with the frozen evidence). The promotion scan gate
     // above keeps the honest (evidence >= 1) occupancy, so no
-    // capacity oversell (the M4S variant rejected in the sandbox).  The
+    // capacity oversell (the M4S variant rejected in the sandbox). The
     // strict flag gates the saturated enumeration below (decided here,
     // before the scan); the reading's remain is re-derived AFTER the
     // scan so the non-saturated branch sees the post-promotion beacon
@@ -3142,7 +3275,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // Activations (rooms zeroed by the decay) consume the hotLimit
         // budget exactly like the single pass; a saturated set renews
         // fully and leaves pass 2 nothing to promote (stable freeze, not
-        // rotation).  Fallen incumbents (v < threshold) are skipped and
+        // rotation). Fallen incumbents (v < threshold) are skipped and
         // decay out, freeing their slots for pass 2.
         for (int iIdx = 0; iIdx < pass.incSize; iIdx++) {
           long v = allValues[incumbentIdx[iIdx]];
@@ -3158,7 +3291,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // (fill): pass 2 — newcomers take the remaining capacity; the
         // capacity check precedes the promotion, so a set that pass 1
         // refilled cannot grow past hotLimit (the single-pass break
-        // would overshoot by one here).  No membership re-test: the
+        // would overshoot by one here). No membership re-test: the
         // newcomer split was decided pre-decay in the merged sweep, and
         // pass 1 re-remain every qualifying incumbent, so no key here
         // can already be a member.
@@ -3198,7 +3331,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       }
     } else {
       // (saturated): no promotion scan runs (every slot is occupied), so
-      // the renewal and earnings signals are enumerated directly.  The
+      // the renewal and earnings signals are enumerated directly. The
       // enumeration walks the packed arrays from the histogram sweep —
       // the pass-1 hashes are reused, one {@code mixHash} per key per
       // tide even on the saturated steady state of a full hot set.
@@ -3207,7 +3340,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // ADR-0049 sweep period), exactly the slots that occupy the set —
       // so stale members (whose keys no longer earn the threshold) are
       // counted as occupied slots with their residual earnings, which is
-      // the squatting signal.  On a sweep SKIP tide the enumeration uses
+      // the squatting signal. On a sweep SKIP tide the enumeration uses
       // the decay-equivalent membership (isBeaconMember floor 2),
       // the frozen-beacon analogue of the post-decay test (ADR-0045 §IV).
       // The renewal numerator counts ONLY beacon members that earned the
@@ -3216,7 +3349,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // cold keys waiting for a slot, and counting them would inflate
       // renewal: with 1024 stale members and 600 new earners the set
       // would read healthy (0.586 >= 0.5) and the squatting evidence
-      // (hotColdRatio) would never be reached.  The self-healing stays
+      // (hotColdRatio) would never be reached. The self-healing stays
       // the 4-tide decay: the stale members' slots free up, and the
       // next scan promotes the earners.
       for (int i = 0; i < pass.packedSize; i++) {
@@ -3239,10 +3372,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
     // (density signal, DensityClimber-style): the hot set's earnings per
     // occupied slot vs the cold reservoir's earnings per key, computed
-    // within this single sample — immune to workload phases.  A ratio
+    // within this single sample — immune to workload phases. A ratio
     // below 1 means the occupied hot slots earn less per slot than cold
     // keys earn per key (a frozen or stale-squatting set); the governor
-    // prices its raise-walk arm on it.  Structurally >= 1 whenever the
+    // prices its raise-walk arm on it. Structurally >= 1 whenever the
     // boundary selects the top earners and the set is refilled, so it
     // fires only in the stale window.
     // Exactly one branch above ran, so the sum is the hot-side key count
@@ -3261,24 +3394,23 @@ public class WaveCounter implements InitializingBean, Destroyable {
     }
 
     moonsTidalForce.onTide(
-      new TideReading(
-        memberKeys / (double) Math.max(1L, remainReading),
-        remainReading,
-        hotLimit,
-        blockedKeys,
-        pass.boundary,
-        hotColdRatio,
-        distinctKeys,
-        tideIntervalMs
-      )
-    );
+        new TideReading(
+            memberKeys / (double) Math.max(1L, remainReading),
+            remainReading,
+            hotLimit,
+            blockedKeys,
+            pass.boundary,
+            hotColdRatio,
+            distinctKeys,
+            tideIntervalMs));
   }
 
   /**
    * Adaptive delay until the next tide, scaled by the backlog delivered this
    * cycle.
    *
-   * <p>Borrows the JVM monitor feedback idea: delivery frequency adapts to
+   * <p>
+   * Borrows the JVM monitor feedback idea: delivery frequency adapts to
    * pressure instead of paying a fixed cadence. A burst (many distinct keys)
    * shortens the cycle toward {@link #EARLY_TIDE_MIN_INTERVAL_MS}, bounding
    * detection latency and keeping the reporter's reservoir away from its
@@ -3296,20 +3428,21 @@ public class WaveCounter implements InitializingBean, Destroyable {
     }
 
     long pressure = Math.min(deliveredKeys, EARLY_TIDE_THRESHOLD_KEYS);
-    long delay =
-      deliverIntervalMs - ((deliverIntervalMs - EARLY_TIDE_MIN_INTERVAL_MS) * pressure) / EARLY_TIDE_THRESHOLD_KEYS;
+    long delay = deliverIntervalMs
+        - ((deliverIntervalMs - EARLY_TIDE_MIN_INTERVAL_MS) * pressure) / EARLY_TIDE_THRESHOLD_KEYS;
     return Math.max(delay, EARLY_TIDE_MIN_INTERVAL_MS);
   }
 
   /**
    * Arm the next tide as a one-shot task (earliest-first, coalesced).
    *
-   * <p><b>Pacer semantics.</b>  If a tide is already pending and its
+   * <p>
+   * <b>Pacer semantics.</b> If a tide is already pending and its
    * fire is still in the future and within
    * {@link #SCHEDULE_TOLERANCE_MS} of the proposed fire, the request is
    * merged (skipped); a meaningfully earlier request cancels the pending
-   * future and re-arms.  Degenerate delays are clamped up to
-   * {@link #EARLY_TIDE_MIN_INTERVAL_MS}.  Safe to call after
+   * future and re-arms. Degenerate delays are clamped up to
+   * {@link #EARLY_TIDE_MIN_INTERVAL_MS}. Safe to call after
    * {@link #destroy()} — the shutdown flag short-circuits, and scheduler
    * rejections are logged.
    *
@@ -3366,11 +3499,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Request an earlier delivery from any thread (an external pressure
    * signal — e.g. a downstream consumer observing a growing backlog
-   * mid-interval).  Earliest-first with coalescing: the request skips
+   * mid-interval). Earliest-first with coalescing: the request skips
    * when the pending tide fires within the tolerance band anyway, and
    * otherwise the pending tide is cancelled and re-armed at
    * {@link #EARLY_TIDE_MIN_INTERVAL_MS} — multiple nudges merge into at
-   * most one schedule.  No-op after {@link #destroy()}.
+   * most one schedule. No-op after {@link #destroy()}.
    */
   public void nudgeTide() {
     scheduleTide(EARLY_TIDE_MIN_INTERVAL_MS);
@@ -3385,12 +3518,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
   /**
    * Final delivery of all merged counts and scheduler shutdown.
    *
-   * <p>Sets {@code shutdown} first (new {@code count()} calls no-op), merges
+   * <p>
+   * Sets {@code shutdown} first (new {@code count()} calls no-op), merges
    * every registered writer's hot local map (mutex-serialized against any
    * in-flight add via the per-map lock), then performs the same
    * swap-and-snapshot as {@link #tide()}.
    *
-   * <p><b>Approximate final add.</b>  The registry sweep
+   * <p>
+   * <b>Approximate final add.</b> The registry sweep
    * cannot enumerate a writer that is racing its FIRST hot registration
    * (or was preempted between registration and its first add), so at
    * most a few residual counts from such a writer can be left undelivered
@@ -3413,7 +3548,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     SHUTDOWN.setVolatile(this, true);
     // Cancel any pending tide (never interrupt a running one): without
     // this an injected scheduler's pending tide would still fire after
-    // destroy().  A concurrently RUNNING tide is not affected — its own
+    // destroy(). A concurrently RUNNING tide is not affected — its own
     // reschedule guard (the shutdown flag) stops the chain.
     synchronized (tideScheduleGate) {
       if (pendingTide != null) {
@@ -3471,11 +3606,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
   }
 
   /**
-   * Writer-private open-addressing map for hot keys.  Accessed only by its
+   * Writer-private open-addressing map for hot keys. Accessed only by its
    * owning thread, except under {@link #lock} by the deliverer when merging
    * the writer's residual data.
    *
-   * <p>The capacity is fixed at {@link #LOCAL_CAPACITY}; the batch trigger
+   * <p>
+   * The capacity is fixed at {@link #LOCAL_CAPACITY}; the batch trigger
    * ({@code opMaxCount}) is at most half of it, so probing never runs out of
    * empty slots.
    */
@@ -3497,7 +3633,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     final int[] tags = new int[LOCAL_CAPACITY];
     /**
      * Occupancy bitmap: bit {@code i} set = slot {@code i}
-     * claimed.  In the lock-free fast add the bit is stored AFTER the
+     * claimed. In the lock-free fast add the bit is stored AFTER the
      * slot writes (release), so a drain can only ever observe a complete
      * entry; a slot whose writer died mid-claim stays unmarked and is
      * simply never swept (the {@code counts[i] != 0} filter is kept as a
@@ -3508,7 +3644,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
     /**
      * Last-key cache for the lock-free fast add (thread-private: written
-     * and read only by the owner thread).  Records the slot of the most
+     * and read only by the owner thread). Records the slot of the most
      * recent successful add so a repeated add of the SAME key instance
      * (reference equality, zero string-compare cost) skips the probe, the
      * {@code equals} AND the routing beacon (see {@link #tryFastAdd}, the
@@ -3519,14 +3655,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * two array loads are the steps skipped, which are exactly the
      * expensive ones for long keys.
      *
-     * <p><b>Staleness protocol.</b>  Any drain ({@link #tryDrainInto}, the
+     * <p>
+     * <b>Staleness protocol.</b> Any drain ({@link #tryDrainInto}, the
      * owner's own {@link #drainInto}, {@link #reconcile},
      * {@link #recoverZero}) may clear the cached slot; the cache is
-     * best-effort, never correctness.  A fast add onto a cleared slot
+     * best-effort, never correctness. A fast add onto a cleared slot
      * observes the 0-return of {@code getAndAdd} and recovers its delta
      * exactly via {@link #recoverZero} (the prior value is provably
      * already in the shared table), then invalidates the cache so the
-     * next add re-claims the slot through the full path.  Every claim
+     * next add re-claims the slot through the full path. Every claim
      * (full path or {@link #addSlow}) re-records the cache, so the cache
      * can never point at a slot holding a DIFFERENT key — a claim is the
      * only way a slot changes keys, and a claim always re-records; the
@@ -3542,10 +3679,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * Drain signal: even = quiescent, odd = a drain/reset is in flight.
      * Written by the deliverer ({@link #tryDrainInto}) and by
      * {@link #reset()}; read by the writer's fast add to choose between
-     * the lock-free and the locked path.  A plain volatile long is enough
+     * the lock-free and the locked path. A plain volatile long is enough
      * (no CAS): only one thread writes it per transition.
      *
-     * <p><b>Asymmetric access modes (ADR-0045 §II weak-ordering).</b>  The
+     * <p>
+     * <b>Asymmetric access modes (ADR-0045 §II weak-ordering).</b> The
      * field is managed by {@link #DRAIN_STAMP}: the writer's FIRST read
      * (the fast/slow decision and the post-check baseline) uses OPAQUE —
      * a stale baseline can only ADD spurious reconciles (a drain that
@@ -3554,12 +3692,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * remove a legitimate race detection, so the ADR-0043 totality
      * argument is untouched; the POST-CHECK and all writes stay VOLATILE
      * (the post-check's total-order participation is what closes the
-     * escape cycle).  The opaque first read drops the per-add acquire on
+     * escape cycle). The opaque first read drops the per-add acquire on
      * weak memory models (AArch64: ldar -> ldr); on x86 it is a no-op.
      */
     long drainStamp;
 
-    /** Access handle for {@link #drainStamp} (opaque first read, volatile post-check/writes). */
+    /**
+     * Access handle for {@link #drainStamp} (opaque first read, volatile
+     * post-check/writes).
+     */
     private static final VarHandle DRAIN_STAMP;
 
     static {
@@ -3571,12 +3712,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
     }
 
     /**
-     * Slow-path mutex.  A {@link ReentrantLock} instead of the monitor so
+     * Slow-path mutex. A {@link ReentrantLock} instead of the monitor so
      * the deliverer can {@link ReentrantLock#tryLock()}: a busy writer
      * never blocks the tide — its residual is skipped for the cycle and
      * delivered by the writer's own batch discharge or the next tide's
      * {@code tryDrainInto}, or by {@link #drainDead} once the writer
-     * is observed dead.  The writer's FAST add does not take this lock — a
+     * is observed dead. The writer's FAST add does not take this lock — a
      * volatile {@link #drainStamp} read plus a post-check instead — so the
      * hot path pays ~2ns instead of the lock/unlock pair; the lock is
      * paid only when a drain is actually in flight (µs-scale, at most
@@ -3592,19 +3733,20 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * is already known — the probe, the {@code equals} AND the routing
      * beacon are skipped entirely (one pointer test, see {@link #lastKey}).
      *
-     * <p><b>Correctness of the pre-routing call.</b>  The cache can only
+     * <p>
+     * <b>Correctness of the pre-routing call.</b> The cache can only
      * reference a key that previously took the hot path (a claim is the
      * only way a slot changes keys, and claims only happen on the routed
-     * hot path), so a hit is a hot-key add by construction.  A drain may
+     * hot path), so a hit is a hot-key add by construction. A drain may
      * have cleared the slot since the cache was recorded — the atomic
      * {@code getAndAdd} then observes the 0 return and recovers the delta
      * exactly via {@link #recoverZero} (the prior value is provably
      * already in the shared table), after which the cache is invalidated
-     * so the next add re-claims through the full path.  A key whose
+     * so the next add re-claims through the full path. A key whose
      * beacon evidence decayed out of the hot set keeps landing in this
      * map until the next drain — its counts still merge into the shared
      * table (a stale hot route, bounded by the next drain), so routing
-     * is affected, exactness never.  The {@link #drainStamp} guard
+     * is affected, exactness never. The {@link #drainStamp} guard
      * (odd = a drain is in flight) returns {@code false} so the caller
      * falls through to the routed path, where the locked slow path
      * serializes with the sweep.
@@ -3636,9 +3778,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * {@link #drainStamp} fast/slow split — see {@link #tryFastAdd} for
      * the repeated-key fast path that precedes this method.
      *
-     * <p>The owner thread normally owns the map exclusively; the only
+     * <p>
+     * The owner thread normally owns the map exclusively; the only
      * concurrent writers are the deliverer's drain and {@code clear()}'s
-     * reset, both brief.  The add reads the {@link #drainStamp}
+     * reset, both brief. The add reads the {@link #drainStamp}
      * (odd = a drain is in flight → take the locked slow path), writes its
      * slot with the occupied bit stored LAST (release), and re-reads the
      * stamp: if it moved, a drain raced us — the entry is either already
@@ -3646,10 +3789,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * bit-store, or the sweep's wholesale clear wiped the bit) — in the
      * latter case the whole map is merged tag-driven via
      * {@link WaveCounter#reconcile(Ceils)}, so the count lands in the
-     * current table with at most a one-tide delay.  Never loss, never
+     * current table with at most a one-tide delay. Never loss, never
      * double count.
      *
-     * <p>The slot index derives from the avalanched hash {@code h}, computed
+     * <p>
+     * The slot index derives from the avalanched hash {@code h}, computed
      * once by {@link WaveCounter#count(String, long)} and shared with the
      * beacon routing check — the tag is the full avalanched hash (0 mapped
      * away, since 0 marks an empty slot).
@@ -3671,7 +3815,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // Open addressing with linear probing: `tag` is the key's hash
       // (0 mapped away, since 0 marks an empty slot); the probe starts at
       // the hashed slot and walks forward, wrapping via the power-of-two
-      // mask.  At most opMaxCount entries are live, so a free slot is
+      // mask. At most opMaxCount entries are live, so a free slot is
       // always reached within the 256-slot table.
       int tag = tagOf(h);
       int i = indexOf(h);
@@ -3691,12 +3835,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
         }
 
         if (tags[i] == tag && keys[i] != null && key.equals(keys[i])) {
-          // existing entry for this key: accumulate and done.  Atomic add:
+          // existing entry for this key: accumulate and done. Atomic add:
           // a concurrent drain's getAndSet either took the slot BEFORE us
           // (prev == 0 → the whole prior value is already in the shared
           // table and only our delta is resident → recover it exactly via
           // {@link #recoverZero}) or AFTER us (it takes our delta with
-          // the rest — nothing to do).  Never lost, never double.
+          // the rest — nothing to do). Never lost, never double.
           long prev = counts.getAndAdd(i, delta);
           if (prev == 0) {
             recoverZero(i, key);
@@ -3707,12 +3851,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // occupied by a different key (hash collision): probe next slot
         i = (i + 1) & (LOCAL_CAPACITY - 1);
       }
-      // (post-check): a drain ran while this add was in flight.  If our
+      // (post-check): a drain ran while this add was in flight. If our
       // entry is still resident, the sweep either missed it (bit stored
       // after its pass) or wiped its bit (the wholesale clear) — merge
       // the whole map tag-driven so the count lands in the current table.
       // If the sweep merged it, the slot is cleared and there is nothing
-      // to do.  Bounded one-tide delay, never loss, never double.
+      // to do. Bounded one-tide delay, never loss, never double.
       if ((long) DRAIN_STAMP.getVolatile(this) != s && tags[i] == tag && keys[i] != null && key.equals(keys[i])) {
         // reconcile merged the whole map and cleared it — the cache must
         // not be recorded for a cleared slot; the next add re-claims
@@ -3723,7 +3867,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
       // (last-key cache): record the slot of this successful add so a
       // repeated add of the SAME key instance skips the probe and the
-      // equals on the next call.  A later drain may clear the slot — the
+      // equals on the next call. A later drain may clear the slot — the
       // fast path's 0-return recovery resolves that (see the field doc).
       lastKey = key;
       lastSlot = i;
@@ -3784,14 +3928,16 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * Drain every non-zero entry into the shared table and reset this map.
      *
-     * <p>{@link #lock} (reentrant): serializes the owner writer's add
-     * against the deliverer's drain of the same map.  A concurrent reset
-     * would otherwise strand half-written entries.  Uncontended in the
+     * <p>
+     * {@link #lock} (reentrant): serializes the owner writer's add
+     * against the deliverer's drain of the same map. A concurrent reset
+     * would otherwise strand half-written entries. Uncontended in the
      * common case (only the owner writer and the periodic deliverer
-     * contend).  Blocking — used by the writer's own batch discharge and by
+     * contend). Blocking — used by the writer's own batch discharge and by
      * {@code destroy()}, both of which must wait out an in-flight add.
      *
-     * <p>The {@code mergesInFlight} reservation is NOT bumped here: the
+     * <p>
+     * The {@code mergesInFlight} reservation is NOT bumped here: the
      * caller ({@link WaveCounter#discharge(Ceils)}) reserves the slot
      * atomically with its table-reference capture, closing the
      * capture-to-bump preemption window that the tide's settle-wait
@@ -3805,9 +3951,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
      *              instead of allocating
      */
     public void drainInto(
-      ConcurrentHashMap<String, LongAdder> table,
-      SoftReference<ConcurrentHashMap<String, LongAdder>> ebb
-    ) {
+        ConcurrentHashMap<String, LongAdder> table,
+        SoftReference<ConcurrentHashMap<String, LongAdder>> ebb) {
       lock.lock();
       try {
         waveTo(table, ebb);
@@ -3824,7 +3969,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * Non-blocking drain for the periodic tide: {@link ReentrantLock#tryLock()}
      * — if the writer holds the map mid-add, the tide skips this writer's
-     * residual for this cycle instead of blocking.  Skipped data is not
+     * residual for this cycle instead of blocking. Skipped data is not
      * lost: the writer's own batch discharge (or the next tide's
      * {@code tryDrainInto}) moves it into the shared table, so a later
      * tide's snapshot picks it up.
@@ -3837,10 +3982,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
      *         writer held the lock and the tide skipped the map
      */
     public boolean tryDrainInto(
-      ConcurrentHashMap<String, LongAdder> table,
-      PaddedMergesInFlight mergesInFlight,
-      SoftReference<ConcurrentHashMap<String, LongAdder>> ebb
-    ) {
+        ConcurrentHashMap<String, LongAdder> table,
+        PaddedMergesInFlight mergesInFlight,
+        SoftReference<ConcurrentHashMap<String, LongAdder>> ebb) {
       if (!lock.tryLock()) {
         return false;
       }
@@ -3872,13 +4016,13 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * Lock-free drain for a DEAD writer (called only after
      * {@link Thread#isAlive()} returned {@code false}): a dead thread can
      * never write again, so the map is quiescent — no lock, no
-     * {@code mergesInFlight} bump (nothing is in flight).  A writer that
+     * {@code mergesInFlight} bump (nothing is in flight). A writer that
      * died after its bit-store leaves a complete, mergeable entry (the bit
      * is stored LAST in {@link #add}); one that died between its slot
      * writes and the bit-store leaves an unmarked slot the bitmap sweep
      * cannot see — the tide's recycle
      * ({@link WaveCounter#recycleCeils}) resets the whole map, so the
-     * half-written slot is wiped either way.  Without this, a writer that
+     * half-written slot is wiped either way. Without this, a writer that
      * died while holding the lock would stall every tide forever (Java
      * locks are not released on thread death).
      *
@@ -3887,36 +4031,35 @@ public class WaveCounter implements InitializingBean, Destroyable {
      *              possibly null)
      */
     public void drainDead(
-      ConcurrentHashMap<String, LongAdder> table,
-      SoftReference<ConcurrentHashMap<String, LongAdder>> ebb
-    ) {
+        ConcurrentHashMap<String, LongAdder> table,
+        SoftReference<ConcurrentHashMap<String, LongAdder>> ebb) {
       waveTo(table, ebb);
       size = 0;
     }
 
     /**
      * Tag-driven full sweep: merge every resident entry into the shared
-     * table and reset the map.  Used by the writer's post-check in
+     * table and reset the map. Used by the writer's post-check in
      * {@link #add} after a racing drain — the drain's sweep may have
      * passed a slot before it was written, so the bit-driven
      * {@link #waveTo} would miss such entries; this sweep scans the tags
-     * instead.  Locked: serialized against the deliverer's drains and the
-     * batch discharge.  ~256 tag reads, paid at most once per writer per
+     * instead. Locked: serialized against the deliverer's drains and the
+     * batch discharge. ~256 tag reads, paid at most once per writer per
      * racing tide.
      *
-     * <p><b>Drain signal.</b>  The stamp is flipped odd under the lock,
+     * <p>
+     * <b>Drain signal.</b> The stamp is flipped odd under the lock,
      * like {@link #tryDrainInto}: {@link WaveCounter#destroy()} calls this
      * cross-thread, and a writer's lock-free fast add must take the
      * locked path instead of racing the sweep — a claim landing after the
      * sweep passed its slot would otherwise escape with no stamp change to
-     * trigger the add's post-check recovery.  Same-thread callers (the
+     * trigger the add's post-check recovery. Same-thread callers (the
      * add's own post-check) are unaffected: the flip only steers
      * concurrent adds.
      */
     public void reconcile(
-      ConcurrentHashMap<String, LongAdder> table,
-      SoftReference<ConcurrentHashMap<String, LongAdder>> ebb
-    ) {
+        ConcurrentHashMap<String, LongAdder> table,
+        SoftReference<ConcurrentHashMap<String, LongAdder>> ebb) {
       lock.lock();
       try {
         // (drain signal): flip the stamp odd so concurrent fast adds take
@@ -3952,15 +4095,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * Recovery for a racing update that landed on a taken slot: the
      * atomic {@code getAndAdd} returned 0, so the slot's prior value is
      * already in the shared table and only this update's residual is
-     * resident here.  The table reference is captured under
+     * resident here. The table reference is captured under
      * {@link WaveCounter#reservoirGate} and the in-flight slot reserved
      * (the same capture/reserve protocol as
      * {@link WaveCounter#discharge(Ceils)}), then the residual is taken
      * and merged into the shared table under the per-map lock and the
-     * slot reclaimed.  The key is passed by the caller — the slot's
-     * tag/key may have been cleared by the taking sweep.  A 0 take
+     * slot reclaimed. The key is passed by the caller — the slot's
+     * tag/key may have been cleared by the taking sweep. A 0 take
      * means the sweep took the residual after our add — nothing left to
-     * merge.  Lock order: reservoirGate → per-map lock, so no deadlock
+     * merge. Lock order: reservoirGate → per-map lock, so no deadlock
      * with the tide paths.
      */
     private void recoverZero(int i, String key) {
@@ -3993,15 +4136,16 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * {@code ConcurrentHashMap}, clearing each slot in-place so that the
      * same sweep both merges counts and reclaims the slot for future use.
      *
-     * <p><b>Bitmap-driven sweep.</b>  Only the claimed slots
+     * <p>
+     * <b>Bitmap-driven sweep.</b> Only the claimed slots
      * (<= opMaxCount of LOCAL_CAPACITY) are visited, instead of a full
-     * 256-slot scan — the per-batch drain cost drops ~4x.  {@link #add}
+     * 256-slot scan — the per-batch drain cost drops ~4x. {@link #add}
      * stores the occupied bit AFTER the slot writes (release), so a
      * bit-marked slot always holds a complete entry and the sweep can
-     * never merge a half-written slot.  The {@code counts[i] == 0} take
+     * never merge a half-written slot. The {@code counts[i] == 0} take
      * (a phantom mark: this sweep's own getAndSet raced a re-claiming
      * writer) skips WITHOUT clearing the slot or the bit — the mark keeps
-     * the racing delta visible for the next sweep.  A writer that died
+     * the racing delta visible for the next sweep. A writer that died
      * between its slot writes and its bit-store leaves an UNMARKED tagged
      * slot this bitmap sweep cannot see — harmless: the dead writer's map
      * is drained (best-effort, the marked entries merge) and then reset
@@ -4009,18 +4153,20 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * {@link #drainDead} and {@link WaveCounter#recycleCeils}), so no
      * half-written slot survives into a permanent probe-chain hazard.
      *
-     * <p>Each merged key recycles its adder from the pool (the previous
+     * <p>
+     * Each merged key recycles its adder from the pool (the previous
      * tide's drained table, already fully summed before publication) via
      * {@link WaveCounter#stealRecycled} instead of allocating — the
      * hot-path drain shares the cold path's zero-allocation property
      * for stable key universes.
      *
-     * <p>First inserts bump {@code approximateSize} exactly like the cold
+     * <p>
+     * First inserts bump {@code approximateSize} exactly like the cold
      * path in {@code count()} (the {@code putIfAbsent} winner is the one
-     * real insert).  The hot-path drains — the first merge of a promoted
+     * real insert). The hot-path drains — the first merge of a promoted
      * key into the fresh table — are first inserts too: without the bump
      * the capacity guard would under-count the table by the resident hot
-     * keys and weaken the cold cap by up to {@code hotLimit} keys.  The
+     * keys and weaken the cold cap by up to {@code hotLimit} keys. The
      * race with the tide's {@code set(0)}
      * reset is the same documented swap race as the cold path (a drain
      * that captured the OLD table inserts into the drained table — its
@@ -4032,9 +4178,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
      *              possibly null)
      */
     private void waveTo(
-      ConcurrentHashMap<String, LongAdder> table,
-      SoftReference<ConcurrentHashMap<String, LongAdder>> ebb
-    ) {
+        ConcurrentHashMap<String, LongAdder> table,
+        SoftReference<ConcurrentHashMap<String, LongAdder>> ebb) {
       boolean markedQuiescence = false;
       for (int w = 0; w < occupied.length(); w++) {
         long bits = occupied.getAcquire(w);
@@ -4042,7 +4187,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
         while (bits != 0) {
           int j = Long.numberOfTrailingZeros(bits);
           int i = (w << 6) + j;
-          // Atomic take: serialized against the writer's getAndAdd.  A 0
+          // Atomic take: serialized against the writer's getAndAdd. A 0
           // take means the slot was already consumed (or is a phantom
           // mark) — skip it WITHOUT clearing the slot or the bit: a
           // racing update may land its delta right after the take, and
@@ -4052,7 +4197,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
           if (v != 0) {
             // Mark the quiescence gate once for the whole sweep, on the
             // first real merge — an empty drain must not force the tide's
-            // 1ms window.  mergeKey() is called with markQuiescence=false
+            // 1ms window. mergeKey() is called with markQuiescence=false
             // below, so this local flag is the only volatile check on the
             // hot drain path.
             if (!markedQuiescence) {
@@ -4066,7 +4211,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
             mergeKey(table, ebb, keys[i], v, false);
             // Clear the merged slot inline: the entry's value has been
             // moved into the shared table, so the slot is reclaimed on the
-            // same pass — no second sweep.  The callers reset {@code size}
+            // same pass — no second sweep. The callers reset {@code size}
             // after the sweep.
             tags[i] = 0;
             keys[i] = null;
@@ -4095,13 +4240,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * so the map's clear semantics live in one sweep here and inline in
      * the drain sweep).
      *
-     * <p>The per-map lock is taken here too: {@code clear()} can race a
-     * writer's in-flight claim.  A lock-free reset that wipes the slots
+     * <p>
+     * The per-map lock is taken here too: {@code clear()} can race a
+     * writer's in-flight claim. A lock-free reset that wipes the slots
      * between the writer's slot writes and its bit-store (the bit is
      * stored LAST in {@link #add}) would leave the writer's late bit-store
      * marking an emptied slot — a phantom claim bit whose 0 take
      * {@link #waveTo} never clears (a 0 take skips without clearing), so
-     * the bit would be re-visited on every sweep.  Blocking here is
+     * the bit would be re-visited on every sweep. Blocking here is
      * fine: {@code clear()} is off the count hot path.
      */
     void reset() {
@@ -4139,30 +4285,33 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * Pacing state for the adaptive tide cadence (WindowClimber
    * borrowings): an EWMA-smoothed backlog reference with a fast-attack /
    * slow-release asymmetry and a still band, plus the empty-tide stretch
-   * ladder.  Written only by the deliverer thread — no synchronization.
+   * ladder. Written only by the deliverer thread — no synchronization.
    *
-   * <p><b>Attack vs release.</b>  A backlog above the reference by more
+   * <p>
+   * <b>Attack vs release.</b> A backlog above the reference by more
    * than the still band folds in FULLY at once ({@link #pressure(int)}),
    * so a burst shortens the cadence to {@link #EARLY_TIDE_MIN_INTERVAL_MS}
    * on the very next tide — burst detection latency is unchanged from the
-   * raw law.  A backlog BELOW the reference folds at the EMA rate
+   * raw law. A backlog BELOW the reference folds at the EMA rate
    * ({@link #PACER_RELEASE_RATE}), so the fast cadence drains the
    * reservoir for several tides instead of snapping back to the base the
    * moment one quiet tide arrives (the raw law's 50<->500ms ping-pong).
    *
-   * <p><b>Still band.</b>  Moves within
+   * <p>
+   * <b>Still band.</b> Moves within
    * {@link #PACER_STILL_BAND_KEYS} of the reference are noise: the
    * reference does not move (deadband), so a single jittered tide cannot
-   * toggle the ramp.  Movement is decayed, never reset — a burst that
+   * toggle the ramp. Movement is decayed, never reset — a burst that
    * leaves no trace cannot suppress the next one.
    *
-   * <p><b>Empty-tide ladder.</b>  A tide that delivered nothing is not a
+   * <p>
+   * <b>Empty-tide ladder.</b> A tide that delivered nothing is not a
    * workload signal (an empty old table cannot be told apart from "no
    * writer in flight"), so it never touches the reference; instead each
    * consecutive empty tide stretches the next cadence by a power of two,
    * capped at {@link #EMPTY_TIDE_STRETCH_CAP_MULTIPLE} x the base — idle
    * cycles stop paying the 1ms quiescence, the decay sweep and the
-   * scheduler wakeup at the base rate.  Any non-empty tide resets the
+   * scheduler wakeup at the base rate. Any non-empty tide resets the
    * streak (the ladder's confirm).
    */
   private static final class TidePacer {
@@ -4172,7 +4321,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
     /**
      * Fold this tide's raw backlog into the smoothed reference and return
-     * the pressure value for the ramp.  Resets the empty-tide ladder.
+     * the pressure value for the ramp. Resets the empty-tide ladder.
      *
      * @param deliveredKeys distinct keys delivered by this tide
      * @return the smoothed backlog (fast attack, slow release, still band)
@@ -4208,7 +4357,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * The immutable derived view of one promoted tide (WindowClimber's
    * {@code Reading}): the goal-metric signals {@link #promote(Map, long)}
    * computes from the snapshot, bundled so the governor's input contract
-   * is a single typed carrier instead of eight positional primitives.  The
+   * is a single typed carrier instead of eight positional primitives. The
    * record is the seam between the promotion pass and the governor: the
    * same object the deliverer constructs is the object {@code onTide}
    * consumes, so the two sides cannot drift apart (a signal added here
@@ -4234,15 +4383,15 @@ public class WaveCounter implements InitializingBean, Destroyable {
    *                     a rate for the flood signature
    */
   private record TideReading(
-    double renewal,
-    int remain,
-    int hotLimit,
-    int blockedKeys,
-    long boundary,
-    double hotColdRatio,
-    int distinct,
-    long intervalMs
-  ) {}
+      double renewal,
+      int remain,
+      int hotLimit,
+      int blockedKeys,
+      long boundary,
+      double hotColdRatio,
+      int distinct,
+      long intervalMs) {
+  }
 
   /**
    * Mutable per-tide state of one promotion pass (deliverer-only, one
@@ -4254,7 +4403,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
    */
   private static final class PromotionPass {
 
-    /** The promotion floor of this pass, captured once (the governor only moves it in the reading). */
+    /**
+     * The promotion floor of this pass, captured once (the governor only moves it
+     * in the reading).
+     */
     int floor;
     /** Entries packed into allValues / allHashes by the histogram sweep. */
     int packedSize;
@@ -4266,21 +4418,41 @@ public class WaveCounter implements InitializingBean, Destroyable {
     int incSize;
     /** Newcomer index-view size, parallel to newcomerIdx. */
     int newSize;
-    /** Distinct keys accumulated above the boundary bucket (the remaining-slot basis). */
+    /**
+     * Distinct keys accumulated above the boundary bucket (the remaining-slot
+     * basis).
+     */
     long above;
     /** The promotion threshold: max of the floor and the (refined) boundary. */
     long threshold;
-    /** The pure promotion boundary, before the floor (the exact k-th largest since ADR-0054). */
+    /**
+     * The pure promotion boundary, before the floor (the exact k-th largest since
+     * ADR-0054).
+     */
     long boundary = 1;
-    /** The histogram's highest non-empty bucket (the boundary bucket); -1 when the pass was skipped. */
+    /**
+     * The histogram's highest non-empty bucket (the boundary bucket); -1 when the
+     * pass was skipped.
+     */
     int boundaryBucket = -1;
-    /** Whether the exact cutoff's tie band exceeded the remaining slots (the incumbent-first gate). */
+    /**
+     * Whether the exact cutoff's tie band exceeded the remaining slots (the
+     * incumbent-first gate).
+     */
     boolean overflow;
-    /** Keys the floor excludes that WOULD qualify at the top-k cutoff (computed by selectBoundary). */
+    /**
+     * Keys the floor excludes that WOULD qualify at the top-k cutoff (computed by
+     * selectBoundary).
+     */
     int blockedKeys;
-    /** Active hot-set size after this tide's halving decay (0 on sub-minimum tides). */
+    /**
+     * Active hot-set size after this tide's halving decay (0 on sub-minimum tides).
+     */
     int remain;
-    /** Whether THIS tide ran the halving decay (vs a sweep skip tide) — the ADR-0045 §IV phase. */
+    /**
+     * Whether THIS tide ran the halving decay (vs a sweep skip tide) — the ADR-0045
+     * §IV phase.
+     */
     boolean sweepDecay = true;
   }
 
@@ -4290,31 +4462,34 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * {@link #PROMOTION_FLOOR}) is a noise filter, and the only signal it
    * can act on is the health of the hot set it admits.
    *
-   * <p><b>Renewal.</b>  Each promoted tide the governor measures
+   * <p>
+   * <b>Renewal.</b> Each promoted tide the governor measures
    * {@code renewal} = active hot slots whose key earned at least the
-   * threshold this tide, divided by the active slots.  The ratio is
+   * threshold this tide, divided by the active slots. The ratio is
    * counted as keys over bit1 rooms (each {@code promoteToBeacon}
    * counts a key, each activated room counts a slot), so room
    * collisions can push it slightly above 1 — the goal-metric
-   * comparisons are same-scale and unaffected.  A set below
-   * {@link #RENEWAL_TARGET} (0.5) is distressed.  The signal is
+   * comparisons are same-scale and unaffected. A set below
+   * {@link #RENEWAL_TARGET} (0.5) is distressed. The signal is
    * computed on saturated tides as well (see {@code promote}): a full
    * hot set whose members stopped earning is exactly the state a scan
    * gate would hide from the governor.
    *
-   * <p><b>Admit on block.</b>  Health with keys measurably blocked
+   * <p>
+   * <b>Admit on block.</b> Health with keys measurably blocked
    * behind the floor ({@code blockedKeys} — keys at the histogram
    * boundary but below the floor) means the floor is excluding exactly
    * the keys that would renew the hot set: the boundary admits them, the
-   * floor excludes them.  The governor DROPS the floor toward the boundary
+   * floor excludes them. The governor DROPS the floor toward the boundary
    * in one move, admitting the blocked keys so renewal recovers next tide.
    * The branch lives on the HEALTHY path: under distress the same band is
    * the stale tail of the 4-tide membership memory (keys that were hot and
    * stopped earning), which is already below the floor and self-heals by
-   * decay — the drop would re-admit the pollution.  The renewal signal
+   * decay — the drop would re-admit the pollution. The renewal signal
    * disambiguates the two readings of {@code blockedKeys}.
    *
-   * <p><b>Raise-walk (bounded up-probe).</b>  Distress with the hot set
+   * <p>
+   * <b>Raise-walk (bounded up-probe).</b> Distress with the hot set
    * under-earning the cold reservoir ({@code hotColdRatio < 1} — occupied
    * hot slots earn less per slot than cold keys earn per key, the
    * frozen-set signal) arms a bounded raise-walk: the floor steps up per
@@ -4323,19 +4498,21 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * the target across the same persistence that crashes it (a single lucky
    * tide must not keep a raise) and crashes — budgeted return to the base
    * plus backoff — after persistent distress; the audit, the release walk
-   * and the admit-on-block all release an over-raised floor.  Both
+   * and the admit-on-block all release an over-raised floor. Both
    * directions are evidence-based: a raise that does not recover the
    * signal is undone, never ratcheted.
    *
-   * <p><b>Anchor rate memory.</b>  The goal-metric references are frozen
+   * <p>
+   * <b>Anchor rate memory.</b> The goal-metric references are frozen
    * at capture: the veto anchor (the position the last confirmed walk
    * settled on, with the renewal frozen at its arm) for the veto retreat,
-   * {@code walk.baseRenewal} for a release walk's crash bar.  A
+   * {@code walk.baseRenewal} for a release walk's crash bar. A
    * veto or a crash fires only when the current position actually earns
    * less than the reference minus a noise-aware margin (WindowClimber's
    * anchor veto with {@code VETO_MARGIN_MIN}).
    *
-   * <p><b>Noise-adaptive margin.</b>  The veto margin is priced from the
+   * <p>
+   * <b>Noise-adaptive margin.</b> The veto margin is priced from the
    * measured scatter of the recent renewals — an EMA of the per-tide
    * absolute deviation (the WindowClimber {@code Rates} deviation, folded
    * O(1) per tide against the pre-update smoothed renewal as an EMA pair):
@@ -4343,28 +4520,31 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * evidence gap before a veto/undo may fire, quiet ones keep the fixed
    * margin.
    *
-   * <p><b>Idle collapse.</b>  A tide that leaves the hot set completely
+   * <p>
+   * <b>Idle collapse.</b> A tide that leaves the hot set completely
    * empty ({@code activeSlots == 0}) proves the floor exceeds the whole
-   * distribution — nothing can qualify, so filtering is meaningless.  The
+   * distribution — nothing can qualify, so filtering is meaningless. The
    * floor collapses to the seed immediately instead of walking back
    * through the slow audit ({@link #AUDIT_WAIT}), which a
    * fast-rotating workload can outrun.
    *
-   * <p><b>Retreat.</b>  Kept as defense: if distress survives
+   * <p>
+   * <b>Retreat.</b> Kept as defense: if distress survives
    * {@link #VETO_STREAK} tides while the floor stands measurably above
    * the last confirmed walk's anchor (more than the {@link #ANCHOR_BAND}
    * jitter band — a floor within the band of its anchor retreating into
    * itself changes nothing and costs flicker)
    * and earns less than the anchor's reference
    * minus the noise margin, the floor returns to the anchor in
-   * {@link #RETURN_BUDGET} budgeted strides.  The veto first stages the
+   * {@link #RETURN_BUDGET} budgeted strides. The veto first stages the
    * direction (ADR-0058), and since ADR-0059 the stage-0 descent reads
    * the live renewal on every stride (see {@code retreat()}): a rung that
    * earns the target parks there, and a descent that keeps under-earning
    * its own start for {@link #SLOPE_STREAK} tides is FALSIFIED — the
    * retreat pivots instead of dumping to a stale anchor claim.
    *
-   * <p><b>Workload shift (R3).</b>  A single-tide move of the goal
+   * <p>
+   * <b>Workload shift (R3).</b> A single-tide move of the goal
    * metric at or above {@link #RESTART_THRESHOLD} (0.05, WindowClimber's
    * threshold) announces a regime change: the parked machine discards
    * its references — the renewal EMA pair, the distress
@@ -4372,20 +4552,21 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * re-learns from here instead of smoothing across the shift
    * (Caffeine's {@code Anchor.standDown} + {@code Rates.reset}, with the
    * reset ordered BEFORE the fold so the shift tide's sample seeds the
-   * new regime).  The
+   * new regime). The
    * floor is deliberately untouched (the position was earned; only the
    * references are stale), the audit clock survives (position stillness
    * is orthogonal to the rate), and the walk/retreat machinery — which
    * expects renewal swings — never stands down.
    *
-   * <p><b>Release.</b>  A raised floor is a ratchet: it comes back down
+   * <p>
+   * <b>Release.</b> A raised floor is a ratchet: it comes back down
    * under saturation (the hot set at
    * {@link #SATURATION_FRACTION} of capacity while healthy — the
    * floor admits more), under the audit (health sustained for
    * {@link #AUDIT_WAIT} still tides steps the floor one probe
    * down), and under the admit-on-block when genuinely hot keys are
-   * blocked.  The floor is clamped to
-   * [{@link #PROMOTION_FLOOR}, {@link #FLOOR_MAX}].  The release
+   * blocked. The floor is clamped to
+   * [{@link #PROMOTION_FLOOR}, {@link #FLOOR_MAX}]. The release
    * walk itself strides by a noise-priced law: the stride is the initial
    * probe step scaled by the smoothed (EMA) renewal against the
    * walk's own crash bar ({@code baseRenewal - vetoMargin()}), clamped to
@@ -4397,36 +4578,41 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * approaching the bar the walk creeps so
    * the verdict samples the decision zone at fine granularity, and a
    * below-bar descent is bounded instead of plunging to the seed before
-   * the crash verdict fires.  The raise direction prices its stride
+   * the crash verdict fires. The raise direction prices its stride
    * independently (the density-proportional law, ADR-0053), so the two
    * walks never share a movement law.
    *
-   * <p><b>Confirm-time correction (ADR-0051).</b>  A raise CONFIRM that
+   * <p>
+   * <b>Confirm-time correction (ADR-0051).</b> A raise CONFIRM that
    * lands with a non-empty blocked band (floor above the boundary while
    * the set is healthy) is over-filtering: the boundary admits the band,
-   * the floor excludes it.  The confirmation's position is corrected to
+   * the floor excludes it. The confirmation's position is corrected to
    * the boundary immediately (the parked admit would do the same next
    * tide), and the veto anchor plants at the corrected position so a
    * later distress cannot veto the floor back down — a move that changes
    * nothing (the threshold is {@code max(floor, boundary)}) and costs
-   * flicker.  The walk still gets its durable 3-tide confirmation; the
+   * flicker. The walk still gets its durable 3-tide confirmation; the
    * rejected mid-walk admit (ADR-0046) aborted the walk on the FIRST
    * healthy tide and collapsed the confirm mechanism.
    *
-   * <p><b>Confirm shield (ADR-0051).</b>  A confirmed raise leaves the
+   * <p>
+   * <b>Confirm shield (ADR-0051).</b> A confirmed raise leaves the
    * RAISE ladder refractory for {@link #CONFIRM_SHIELD} tides (rung
    * untouched), so the machine cannot re-arm into an immediate
    * arm-confirm cycle — the alternating-workload ratchet that climbed the
    * floor step by step until the empty-set collapse undid the probe.
    *
-   * <p><b>Hard walk budget (ADR-0051).</b>  The raise walk's sample
+   * <p>
+   * <b>Hard walk budget (ADR-0051).</b> The raise walk's sample
    * budget binds on BOTH verdict branches: the legacy budget check lived
    * only on the below-target branch, so an alternating walk outlived the
    * documented {@link MoonsTidalForce#TIDAL_WALK_BUDGET} by up to ~1.5x.
    */
   private static final class MoonsTidalForce {
 
-    /** Tides a walk may take before it is confirmed (Caffeine's PROBE_WALK_BUDGET). */
+    /**
+     * Tides a walk may take before it is confirmed (Caffeine's PROBE_WALK_BUDGET).
+     */
     private static final int TIDAL_WALK_BUDGET = 16;
     /**
      * Consecutive tides a walk needs on its goal-metric side before it
@@ -4449,7 +4635,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     private static final int PROBE_CRASH_ESCALATION = 2;
     /**
      * Distress tides before a raise-walk may arm (a single noisy tide must
-     * not arm one).  The stale tail of the membership memory (ADR-0049:
+     * not arm one). The stale tail of the membership memory (ADR-0049:
      * 4-tide) keeps distress visible for up to ~4 tides per pollution wave,
      * so a transient dip CAN arm a walk; the arm delay stays at its
      * minimum because the walk's own verdict machinery — 3-tide crash on
@@ -4467,7 +4653,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * The evidence gap on the renewal goal metric before a veto or an undo
      * may fire (WindowClimber's {@code VETO_MARGIN_MIN} analog): the
      * current position must earn at least this much less than the frozen
-     * reference before the machine distrusts it.  The effective margin is
+     * reference before the machine distrusts it. The effective margin is
      * the max of this and twice the measured renewal scatter (see
      * {@link #vetoMargin()}).
      */
@@ -4482,10 +4668,16 @@ public class WaveCounter implements InitializingBean, Destroyable {
      */
     private static final double RENEWAL_SMOOTHING = 0.2;
 
-    /** Cached {@code Math.log(2.0)} for the density-priced raise stride (avoids a constant recompute per raise step). */
+    /**
+     * Cached {@code Math.log(2.0)} for the density-priced raise stride (avoids a
+     * constant recompute per raise step).
+     */
     private static final double LN_2 = Math.log(2.0);
 
-    /** Cached {@code 1 / Math.log(2.0)} so the raise-stride log2 is a multiply, not a divide, per step. */
+    /**
+     * Cached {@code 1 / Math.log(2.0)} so the raise-stride log2 is a multiply, not
+     * a divide, per step.
+     */
     private static final double INV_LN_2 = 1.0 / LN_2;
 
     /**
@@ -4506,20 +4698,22 @@ public class WaveCounter implements InitializingBean, Destroyable {
     // {@code Positions} seeds the adaptive floor at {@link #PROMOTION_FLOOR},
     // {@link Ladder} keeps the raise and release retry ledgers as two
     // independent state groups selected by its internal {@link Ladder.Direction}
-    // enum instead of a half-segmented packed word).  The two P1 debounce
+    // enum instead of a half-segmented packed word). The two P1 debounce
     // accumulators (`quietMs`, `noiseMs`) are plain ints of the {@link Regime}
-    // wrapper — saturating, deliverer-only writes.  The governor's
+    // wrapper — saturating, deliverer-only writes. The governor's
     // {@code double} renewal signals live with their owning state too: the
     // veto anchor renewal in {@link Positions}, the descent slope reference
     // in {@link State} and the smoothed-renewal EMA pair in {@link Rates}
     // (each wrapper's {@code reset()} keeps its fields' seeding consistent).
     // Every state value is written only by the deliverer thread, so the
-    // accessors remain plain, non-atomic updates.  The {@code lastRenewal}
+    // accessors remain plain, non-atomic updates. The {@code lastRenewal}
     // and {@code vol} signals below stay separate fields: a rolling sample
     // reference and a continuous EWMA, where fixed-point encoding would lose
     // precision on the governor's most sensitive path.
 
-    /** Position-domain state (floor, retreat target, anchors) — {@link Positions}. */
+    /**
+     * Position-domain state (floor, retreat target, anchors) — {@link Positions}.
+     */
     private final Positions positions = new Positions(PROMOTION_FLOOR);
 
     /** Retreat-probe and persistence state — {@link State}. */
@@ -4528,7 +4722,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /** P1 regime-switch debounce accumulators (wall-clock ms) — {@link Regime}. */
     private final Regime debounce = new Regime();
 
-    /** The raise and release retry ledgers (independent state per internal direction) — {@link Ladder}. */
+    /**
+     * The raise and release retry ledgers (independent state per internal
+     * direction) — {@link Ladder}.
+     */
     private final Ladder ladder = new Ladder();
 
     /** Smoothed-renewal EMA pair (mean + deviation) — {@link Rates}. */
@@ -4538,7 +4735,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * The previous tide's raw renewal — the reference of the R3
      * workload-shift test (Caffeine's {@code Sample.previousHitRate}):
      * a single-tide move at or above {@link #RESTART_THRESHOLD}
-     * announces a regime change.  {@code NaN} = unseeded (no previous
+     * announces a regime change. {@code NaN} = unseeded (no previous
      * sample yet); survives collapse and the stand-down itself — only
      * the tide flow updates it.
      */
@@ -4547,7 +4744,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * EWMA of the per-tide snapshot volume (ADR-0045 §III), folded by
      * {@link #onVolume(long)} on every non-empty tide — 0 is the unseeded
-     * marker (seeded with the first raw sample after a reset).  The quiet
+     * marker (seeded with the first raw sample after a reset). The quiet
      * bypass and the flood collapse are volume-gated: the floor's absolute
      * position must match the regime's scale.
      */
@@ -4562,34 +4759,40 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /** Direction-probe retreat: hold and sample renewal before committing. */
     private static final int RETREAT_STAGE_PROBE = PROBE_STREAK;
 
-    /** A walk in flight ({@code up} = raise, {@code down} = release), or {@code null} when parked. */
+    /**
+     * A walk in flight ({@code up} = raise, {@code down} = release), or
+     * {@code null} when parked.
+     */
     private Walk walk;
 
     /**
      * Advance the governor by one promoted tide.
      *
-     * <p>The reading is the immutable derived view of this tide built by
+     * <p>
+     * The reading is the immutable derived view of this tide built by
      * {@link #promote(Map, long)} (WindowClimber's {@code Reading} pattern):
      * the goal-metric signals are bundled into one typed carrier instead
      * of eight positional primitives, so the promotion pass and the
      * governor share a single documented contract.
      *
-     * <p><b>P1 (quiet bypass, ADR-0045 §III).</b>  A volume-quiet regime
+     * <p>
+     * <b>P1 (quiet bypass, ADR-0045 §III).</b> A volume-quiet regime
      * ({@code vol < QUIET_VOLUME}) with an empty hot set drops the floor to
      * {@link #QUIET_FLOOR} (1) so ANY key routes hot and the scan gate is
-     * lifted (sub-minimum snapshots promote).  The floor's noise role is
+     * lifted (sub-minimum snapshots promote). The floor's noise role is
      * vacuous with no traffic, the slots are free, and a stale raised floor
-     * must not survive into the next regime.  Both switches are debounced
+     * must not survive into the next regime. Both switches are debounced
      * by accumulated wall time: a quiet regime lasts seconds.
      *
-     * <p><b>P2 (flood collapse, ADR-0045 §III).</b>  A RAISED floor on which NO
+     * <p>
+     * <b>P2 (flood collapse, ADR-0045 §III).</b> A RAISED floor on which NO
      * key of a HIGH-volume snapshot earns the threshold (the
      * {@link #floodSignature} — renewal 0, floor above the
      * boundary, band non-empty, rate at/above {@link #FLOOD_RATE_PER_SEC})
      * is stale from another regime, not a noise filter: the correct
      * response is the empty-set collapse's full reset in ONE tide instead
      * of the wrong-direction raise-walk (parked by the renewal==0 step
-     * gate) plus the slow 4-tide decay + remain==0 collapse.  The FLOOD
+     * gate) plus the slow 4-tide decay + remain==0 collapse. The FLOOD
      * also plants {@link State#floodLock}, which suppresses the ARM until the
      * volume drops below the flood rate (a raise and a flood collapse are
      * contradictory responses to the same state).
@@ -4653,7 +4856,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * Regime-change collapse (ADR-0045): the empty-set collapse and
      * the P2 flood collapse share one full reset with the same ladder
-     * pricing.  An empty hot set ({@code remain == 0}) while the floor
+     * pricing. An empty hot set ({@code remain == 0}) while the floor
      * sits above the absolute seed proves that the floor exceeds the whole
      * distribution — no key can qualify, so filtering is meaningless and
      * the floor collapses to the seed immediately instead of walking back
@@ -4661,10 +4864,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * The same applies to a stale RAISED floor blocking the whole incoming
      * distribution at high volume (the flood signature — ADR-0045 §III).
      *
-     * <p>All in-flight experiments are cancelled: a budgeted retreat would
+     * <p>
+     * All in-flight experiments are cancelled: a budgeted retreat would
      * drag the floor back toward a stale probe base over the coming tides,
      * and a crashed walk would do the same via its undo — both defeating
-     * the collapse.  The distress/veto history, the audit clock, the
+     * the collapse. The distress/veto history, the audit clock, the
      * anchor, the renewal references (the smoothed
      * signal and its deviation EMA) and the
      * volume signal are all reset because an empty set is a regime change.
@@ -4673,16 +4877,18 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * recovers (the anchor is recaptured by the next confirmed walk of the
      * new regime).
      *
-     * <p><b>Ladder pricing on a walk-inflicted collapse (ADR-0045 §II).</b>
+     * <p>
+     * <b>Ladder pricing on a walk-inflicted collapse (ADR-0045 §II).</b>
      * An in-flight walk killed by the collapse is priced FAILED (its own
      * fault: the raised floor outran the earners) BEFORE the wipe, and ANY
      * priced ladder state (a crash/fail price that landed before the
      * collapse, e.g. during the post-verdict retreat) survives it — the
-     * backoff throttle keeps the oscillation probe loop bounded.  A
+     * backoff throttle keeps the oscillation probe loop bounded. A
      * collapse with NO walk in flight (a genuine regime change) keeps the
      * full reset.
      *
-     * <p>{@code floodLock} deliberately survives the wipe (planted AFTER
+     * <p>
+     * {@code floodLock} deliberately survives the wipe (planted AFTER
      * this call by the FLOOD call site): a wipe that cleared it would
      * re-arm into the same flood.
      */
@@ -4717,7 +4923,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       endWalk();
       // The empty set is a regime change: the distress/veto history,
       // the audit run, the anchor and the renewal references all
-      // belong to the old regime.  Reset them so the new regime starts
+      // belong to the old regime. Reset them so the new regime starts
       // from a blank slate — a stale distressTides together with a stale
       // anchor could otherwise trigger one spurious retreat after the
       // workload recovers (the anchor is recaptured by the next
@@ -4727,9 +4933,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
       ladder.reset(RAISE);
       ladder.reset(RELEASE);
       // The volume signal and the quiet/isDqQuiet accumulators belong to the
-      // old regime — re-seeded by the next tide.  The renewal references
+      // old regime — re-seeded by the next tide. The renewal references
       // (the smoothed signal and its deviation) belong to it too — re-seeded
-      // by the next fold.  floodLock deliberately survives
+      // by the next fold. floodLock deliberately survives
       // (planted by the FLOOD call site AFTER this call): a wipe
       // that cleared it would re-arm into the same flood.
       vol = 0.0;
@@ -4747,11 +4953,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
     /**
      * The P2 flood signature (ADR-0045 §III): a high-volume snapshot on which NO
-     * key earns the threshold while the floor does the selection.  Used
+     * key earns the threshold while the floor does the selection. Used
      * both as the FLOOD collapse trigger and to suppress the ARM — a raise
      * and a flood collapse are contradictory responses to the same state;
      * at high volume the stale-floor interpretation wins, so the floor must
-     * not be raised into an instant collapse.  Conditions: no earner
+     * not be raised into an instant collapse. Conditions: no earner
      * (renewal <= 0), blocked band present, floor above boundary, sufficient
      * distinct keys, and rate at/above the flood threshold.
      *
@@ -4768,13 +4974,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * @return true when the flood signature holds
      */
     private boolean floodSignature(double renewal, int blockedKeys, long boundary, int distinct, double rate) {
-      return (
-        renewal <= 0.0 &&
-        blockedKeys > 0 &&
-        positions.floor > boundary &&
-        distinct >= FLOOD_MIN_DISTINCT &&
-        rate >= FLOOD_RATE_PER_SEC
-      );
+      return (renewal <= 0.0 &&
+          blockedKeys > 0 &&
+          positions.floor > boundary &&
+          distinct >= FLOOD_MIN_DISTINCT &&
+          rate >= FLOOD_RATE_PER_SEC);
     }
 
     /**
@@ -4782,14 +4986,14 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * {@code Anchor.standDown} + {@code Rates.reset}): the goal-metric
      * references, the distress streak and the renewal EMA are discarded
      * — the machine re-learns from here instead of smoothing across the
-     * shift.  The FLOOR is deliberately untouched (the position was
+     * shift. The FLOOR is deliberately untouched (the position was
      * earned; only the references are stale), the raise stride needs no
      * re-seed (it is a pure function of each tide's density reading since
      * ADR-0053 — the retired step-state knob was removed with the
      * fixed-step law), and the AUDIT clock survives (Caffeine's
      * AuditClock: "what must be still is the position, never the rate" —
      * a rate swing must not suppress the re-test of a still
-     * equilibrium).  The veto anchor is discarded only when the shift
+     * equilibrium). The veto anchor is discarded only when the shift
      * happened AT the anchor position (within {@link #ANCHOR_BAND}): a
      * claim tested at its own position and found wrong is discarded, but
      * a shift far from the anchor is typically the controller's own
@@ -4800,7 +5004,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // The shift landed AT the anchor: the claim is discarded (tested at
         // its own position and found wrong), but the FLOOR is deliberately
         // untouched — the position was earned, only the references are
-        // stale.  (Positions.reset() would clear the floor too, so the
+        // stale. (Positions.reset() would clear the floor too, so the
         // anchor fields are wiped by hand here.)
         positions.anchorD = 0;
         positions.anchorD_Renewal = 0;
@@ -4821,7 +5025,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * Empty-set collapse: when the hot set is completely empty
      * ({@code remain == 0}) but the floor still sits above the absolute
      * seed, the floor has overshot the entire key distribution and is
-     * filtering nothing.  Rather than drifting back down via the slow
+     * filtering nothing. Rather than drifting back down via the slow
      * audit (which a fast-rotating workload can outrun), the governor
      * resets its full state immediately — anchoring at the seed and
      * discarding all stale distress, audit, walk, and renewal history
@@ -4841,10 +5045,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * P1 entry (quiet bypass, ADR-0045 §III): a volume-quiet regime
      * ({@code vol < QUIET_VOLUME}) with an empty hot set drops the floor
      * to {@link #QUIET_FLOOR} (1) so ANY key routes hot and the scan gate
-     * is lifted (sub-minimum snapshots promote).  The floor's noise role
+     * is lifted (sub-minimum snapshots promote). The floor's noise role
      * is vacuous with no traffic, the slots are free, and a stale raised
-     * floor must not survive into the next regime.  Debounced by
-     * accumulated wall time (a quiet regime lasts seconds).  Ordered
+     * floor must not survive into the next regime. Debounced by
+     * accumulated wall time (a quiet regime lasts seconds). Ordered
      * AFTER the empty-set collapse (a stale raised floor collapses first,
      * then the next tide's fresh volume seed re-evaluates the quiet
      * state).
@@ -4884,20 +5088,20 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * another regime, not a noise filter: the correct response is the
      * empty-set collapse's full reset in ONE tide instead of the
      * wrong-direction raise-walk (parked by the renewal==0 step gate)
-     * plus the slow 4-tide decay + remain==0 collapse.  Also plants
+     * plus the slow 4-tide decay + remain==0 collapse. Also plants
      * {@link State#floodLock}, which suppresses the ARM until the volume drops
      * below the flood rate (a raise and a flood collapse are
      * contradictory responses to the same state).
      *
-     * @param rate        the tide's volume rate (counts/sec), computed once
-     *                    by {@link #onTide(TideReading)}
+     * @param rate the tide's volume rate (counts/sec), computed once
+     *             by {@link #onTide(TideReading)}
      * @return true when the flood collapse ran and the tide is handled
      */
     private boolean floodCollapse(boolean floodSig, double rate) {
       // The lock clears when the volume drops below the flood rate (a
       // genuine regime change); the seed floor's noise role stays intact
       // (a high-volume window under the SEED floor is designed behavior —
-      // the collapse gate requires floor > seed).  floodSig is the flood
+      // the collapse gate requires floor > seed). floodSig is the flood
       // signature precomputed once in onTide; its conditions subsume
       // rate >= FLOOD_RATE_PER_SEC, so the collapse branch only adds the
       // floor-above-seed test (no recomputation on the distress path).
@@ -4919,25 +5123,33 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * parked machine discards its references (the goal-metric memory, the
      * noise references, the distress streak; the anchor only when the
      * shift happened AT the anchor position) and re-learns from here
-     * instead of smoothing across the shift.  The walk and retreat
+     * instead of smoothing across the shift. The walk and retreat
      * machinery — which EXPECTS renewal swings — is untouched; the audit
-     * clock survives (position stillness, not the rate).  The stand-down
+     * clock survives (position stillness, not the rate). The stand-down
      * runs BEFORE the fold (Caffeine's Rates.reset-then-update ordering):
      * the shift tide's sample is the FIRST sample of the new regime and
-     * seeds the re-learned references.  The deviation then folds against
+     * seeds the re-learned references. The deviation then folds against
      * the PRE-update smoothed renewal, as one EMA pair (O(1) per tide).
      */
     private void foldRenewal(double renewal) {
       boolean workloadShift = !Double.isNaN(lastRenewal) && Math.abs(renewal - lastRenewal) >= RESTART_THRESHOLD;
       lastRenewal = renewal;
-      // Stand-down is deferred to the parked state on purpose.  The walk and retreat verdicts use
-      // their OWN frozen renewal (walk.baseRenewal / retreatStartRenewal), never the live anchor,
-      // so a stale anchor mid-experiment cannot distort a verdict the way Caffeine's anchor-veto
-      // weave would.  The anchor is only re-learned on a CONFIRM or a parked standDown — an
-      // unconfirmed walk (undoWalk) deliberately leaves it untouched, because a walk that ends
-      // without a verdict yields no new anchor evidence — so deferring the re-learn here is safe:
-      // the shift is absorbed by the very next parked fall-through.  If a future change re-couples
-      // a verdict to the live anchor, this gate must broaden to match Caffeine's Anchor.standDown
+      // Stand-down is deferred to the parked state on purpose. The walk and retreat
+      // verdicts use
+      // their OWN frozen renewal (walk.baseRenewal / retreatStartRenewal), never the
+      // live anchor,
+      // so a stale anchor mid-experiment cannot distort a verdict the way Caffeine's
+      // anchor-veto
+      // weave would. The anchor is only re-learned on a CONFIRM or a parked standDown
+      // — an
+      // unconfirmed walk (undoWalk) deliberately leaves it untouched, because a walk
+      // that ends
+      // without a verdict yields no new anchor evidence — so deferring the re-learn
+      // here is safe:
+      // the shift is absorbed by the very next parked fall-through. If a future
+      // change re-couples
+      // a verdict to the live anchor, this gate must broaden to match Caffeine's
+      // Anchor.standDown
       // or a stale anchor survives the experiment.
       if (workloadShift && !isWalking() && state.retreatStage == RETREAT_STAGE_STOPPED) {
         standDown();
@@ -4945,8 +5157,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
       if (Double.isNaN(rates.smoothedRenewal)) {
         rates.smoothedRenewal = renewal;
       } else {
-        rates.renewalDeviation +=
-          RENEWAL_SMOOTHING * (Math.abs(renewal - rates.smoothedRenewal) - rates.renewalDeviation);
+        rates.renewalDeviation += RENEWAL_SMOOTHING
+            * (Math.abs(renewal - rates.smoothedRenewal) - rates.renewalDeviation);
         rates.smoothedRenewal += RENEWAL_SMOOTHING * (renewal - rates.smoothedRenewal);
       }
     }
@@ -4957,25 +5169,27 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * at most {@link #STEP_RETURN_MAX} (half the remaining distance plus
      * one, so the walk converges without overshooting the anchor).
      *
-     * <p><b>Direction stride probe (ADR-0058).</b>  When the veto armed a
+     * <p>
+     * <b>Direction stride probe (ADR-0058).</b> When the veto armed a
      * stage-1 retreat (see {@link State#retreatStage}), the first
      * {@link #PROBE_STREAK} tides HOLD the veto position and sample the
      * live renewal — the retreat's direction (down toward the anchor) is
-     * only a hypothesis.  A recovery (renewal at or above
+     * only a hypothesis. A recovery (renewal at or above
      * {@link #RENEWAL_TARGET}) settles here and RE-PLANTS the anchor at the
      * held position (the raise's position was right; the veto was a noise
      * streak), exactly WindowClimber's "only keep a position on a clear
-     * verdict".  A persistent shortfall deepens to the shallow interval
+     * verdict". A persistent shortfall deepens to the shallow interval
      * target {@link Positions#anchorS} when the floor stands measurably
      * above it, else to the base {@link Positions#anchorD}.
      *
-     * <p><b>Descent slope probe (ADR-0059).</b>  The stage-0 descent — the
+     * <p>
+     * <b>Descent slope probe (ADR-0059).</b> The stage-0 descent — the
      * budgeted walk toward the deepened target — is no longer blind: every
      * stride reads the live renewal (veto retreats only; walk undos stay
-     * verdict-blind per ADR-0058).  A rung that earns the target parks
+     * verdict-blind per ADR-0058). A rung that earns the target parks
      * there and re-plants the anchor (MID-DESCENT RECOVERY — the blind
      * descent walked past the first healthy rung to a target that was
-     * never re-measured).  A renewal that keeps under-earning the
+     * never re-measured). A renewal that keeps under-earning the
      * descent's OWN start (the veto-arm sample, refreshed by the last
      * probe sample) minus the noise margin for {@link #SLOPE_STREAK}
      * tides FALSIFIES the down direction: the retreat stops and pivots —
@@ -4997,17 +5211,17 @@ public class WaveCounter implements InitializingBean, Destroyable {
         state.retreatStage--;
         if (renewal >= RENEWAL_TARGET) {
           // The veto's direction hypothesis was wrong — the confirmed
-          // position still earns.  Settle here and re-plant the anchor:
+          // position still earns. Settle here and re-plant the anchor:
           // this becomes the position future vetoes back off to.
-          plant(renewal, /*moveFloorToTarget=*/ true, /*discardAnchor=*/ false);
+          plant(renewal, /* moveFloorToTarget= */ true, /* discardAnchor= */ false);
         } else if (state.retreatStage == RETREAT_STAGE_DOING) {
           // The hold keeps under-earning: the veto direction holds.
           // Deepen to the last VERIFIED position (the interval anchor)
           // when the floor stands measurably above it, else to the base.
           positions.retreatTarget = (positions.anchorS > positions.anchorD &&
-            positions.floor > positions.anchorS + ANCHOR_BAND)
-            ? positions.anchorS
-            : positions.anchorD;
+              positions.floor > positions.anchorS + ANCHOR_BAND)
+                  ? positions.anchorS
+                  : positions.anchorD;
 
           state.retreatStartRenewal = renewal;
           state.retreatStage = RETREAT_STAGE_DOING;
@@ -5021,17 +5235,17 @@ public class WaveCounter implements InitializingBean, Destroyable {
           // (the floor is already at it) and re-plant the anchor; the
           // descent STOPS instead of walking past the first healthy rung
           // to the interval/base that was never re-measured.
-          plant(renewal, /*moveFloorToTarget=*/ false, /*discardAnchor=*/ false);
+          plant(renewal, /* moveFloorToTarget= */ false, /* discardAnchor= */ false);
           return true;
         }
         if (renewal < state.retreatStartRenewal - vetoMargin()) {
           state.retreatWorseCount++;
           if (state.retreatWorseCount >= SLOPE_STREAK) {
             // The descent keeps under-earning the retreat's own start — the
-            // slope falsifies the down direction.  Stop the retreat and
+            // slope falsifies the down direction. Stop the retreat and
             // discard the stale claim; the parked distress re-arms the raise
             // direction (the reverse attempt) from the pivot rung.
-            plant(0.0, /*moveFloorToTarget=*/ false, /*discardAnchor=*/ true);
+            plant(0.0, /* moveFloorToTarget= */ false, /* discardAnchor= */ true);
             state.distressTides = 0;
             return true;
           }
@@ -5052,17 +5266,27 @@ public class WaveCounter implements InitializingBean, Destroyable {
     }
 
     /**
-     * Re-plants the veto anchor and stops the retreat (ADR-0058/0059 settle / stand-down).
-     * Extracted from the three near-identical blocks in {@link #retreat(double)}: the floor is
-     * optionally moved to the held {@code retreatTarget}, the anchor is either re-planted at the
-     * (new) floor or discarded to zero (the falsified-claim case), and the retreat machinery is
-     * fully reset.  The reset is safe because a stopped retreat ({@code RETREAT_STAGE_STOPPED})
-     * short-circuits {@link #retreat(double)} and every re-arm (distress / undo) re-initializes
+     * Re-plants the veto anchor and stops the retreat (ADR-0058/0059 settle /
+     * stand-down).
+     * Extracted from the three near-identical blocks in {@link #retreat(double)}:
+     * the floor is
+     * optionally moved to the held {@code retreatTarget}, the anchor is either
+     * re-planted at the
+     * (new) floor or discarded to zero (the falsified-claim case), and the retreat
+     * machinery is
+     * fully reset. The reset is safe because a stopped retreat
+     * ({@code RETREAT_STAGE_STOPPED})
+     * short-circuits {@link #retreat(double)} and every re-arm (distress / undo)
+     * re-initializes
      * these fields.
      *
-     * @param renewal           the live renewal to freeze as the anchor reference (0 when discarding)
-     * @param moveFloorToTarget whether the floor moves to {@code retreatTarget} (probe recovery) or stays (descent recovery / slope falsify)
-     * @param discardAnchor     whether the anchor is cleared to zero (slope falsify) instead of re-planted
+     * @param renewal           the live renewal to freeze as the anchor reference
+     *                          (0 when discarding)
+     * @param moveFloorToTarget whether the floor moves to {@code retreatTarget}
+     *                          (probe recovery) or stays (descent recovery / slope
+     *                          falsify)
+     * @param discardAnchor     whether the anchor is cleared to zero (slope
+     *                          falsify) instead of re-planted
      */
     private void plant(double renewal, boolean moveFloorToTarget, boolean discardAnchor) {
       if (moveFloorToTarget) {
@@ -5085,12 +5309,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
     /**
      * One walk tide: the raise or release walk in flight advances one
-     * step per tide — the goal metric is the health test itself.  A
+     * step per tide — the goal metric is the health test itself. A
      * raise confirms — keeps the raised floor — only after the set holds
      * the target across the same persistence that crashes it (a single
      * lucky tide must not keep a raise; the audit, the release walk and
      * the admit-on-block release an over-raise), and crashes when
-     * distress persists through the crash persistence.  The confirm
+     * distress persists through the crash persistence. The confirm
      * plants the veto anchor at the position the raise left from (the
      * DEEP target) plus the interval anchor at the VERIFIED position
      * (ADR-0058), so a later distress probes the direction before it
@@ -5140,9 +5364,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * blocked band is the stale tail of the 4-tide membership memory —
      * its keys are already below the floor, so a drop would re-admit
      * pollution and a raise cannot reach them; the tail self-heals by
-     * decay within four tides.  The only evidence-based action is the
+     * decay within four tides. The only evidence-based action is the
      * bounded raise-walk, armed when the hot set is genuinely
-     * under-earning the cold reservoir.  Movement DECAYS the audit run
+     * under-earning the cold reservoir. Movement DECAYS the audit run
      * instead of zeroing it (Caffeine's AuditClock.tick): a hard reset
      * would let one floor move per wait suppress audits forever.
      */
@@ -5159,10 +5383,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // only a hypothesis (ADR-0058): before committing, HOLD the veto
         // position and sample the live renewal for PROBE_STREAK tides (the
         // direction stride probe — WindowClimber's "only keep a position on
-        // a clear verdict").  A recovery re-plants the anchor at the held
+        // a clear verdict"). A recovery re-plants the anchor at the held
         // position and cancels the retreat; a persistent shortfall deepens
         // to the last VERIFIED position ({@code anchorConfirmFloor}, the
-        // interval anchor) or the base.  The veto evidence gates remain
+        // interval anchor) or the base. The veto evidence gates remain
         // WindowClimber's anchor veto unchanged: floor >
         // anchorFloor + ANCHOR_BAND keeps a position at or within a jitter
         // band of its anchor from retreating into itself — the move would
@@ -5182,9 +5406,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // Arm the raise-walk WITHOUT taking the first step: the base is
         // frozen at the position the experiment leaves from, and the
         // first step is taken on the next distressed tide that survives
-        // the evidence gates.  This one-tide delay prevents a single
+        // the evidence gates. This one-tide delay prevents a single
         // noisy distress sample from moving the floor before the walk
-        // has produced a second sample (ADR-0045 §II probe hygiene).  The
+        // has produced a second sample (ADR-0045 §II probe hygiene). The
         // density ratio confirms the slots are genuinely under-earning
         // before the machine spends a walk on a mixed signal.
         walk = new Walk(positions.floor, renewal, /* up= */ true);
@@ -5208,8 +5432,8 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // disambiguated): blocked keys are exactly the renewing keys the
         // boundary would admit — excluding them starves the hot set.
         // Drop the floor toward the boundary so they qualify from the
-        // next tide on.  Under distress the same band is the stale tail
-        // and must not be admitted.  Clamped: a boundary above
+        // next tide on. Under distress the same band is the stale tail
+        // and must not be admitted. Clamped: a boundary above
         // GOVERNOR_FLOOR_MAX keeps the floor inside its documented range
         // (inert — the threshold is max(floor, boundary) anyway).
         positions.floor = computeBoundedFloor(boundary);
@@ -5224,7 +5448,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
           }
 
           // Arm the release walk BEFORE the first step: the base is frozen
-          // at the position the experiment leaves from.  The first step
+          // at the position the experiment leaves from. The first step
           // uses the same stride law as the walk: at the arm the smoothed
           // signal is the arm renewal, so the stride is exactly the
           // initial probe step ({@link #STEP_INITIAL} =
@@ -5254,7 +5478,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * 1, so the walk approaches the earners' capacity at fine granularity
      * instead of overshooting it with a fixed step (the fixed-step decay
      * it replaces measured a 51% excess reduction at 300 paired seeds —
-     * see ADR-0053).  The retired step-state knob was removed with it: the
+     * see ADR-0053). The retired step-state knob was removed with it: the
      * stride is a pure function of this tide's density reading.
      *
      * @param hotColdRatio the tide's hot-set earnings per occupied slot
@@ -5272,7 +5496,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
     /**
      * One noise-priced step down (release walk): the stride law, clamped
-     * at the seed.  The single shared release movement — the arm and the
+     * at the seed. The single shared release movement — the arm and the
      * walk branch both move the floor this way, so the first step and
      * every WALKING tide are priced by the same law.
      *
@@ -5284,12 +5508,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
     /**
      * Clamp the promotion floor to the histogram boundary, bounded by the
-     * absolute seed and the ceiling.  Used by the healthy admit-on-block
+     * absolute seed and the ceiling. Used by the healthy admit-on-block
      * path: when the boundary is below the current floor (and above the
      * seed), the floor drops to the boundary so the blocked keys qualify
      * from the next tide on; when the boundary is below the seed, the seed
      * remains as the noise floor; the ceiling keeps the floor inside its
-     * documented range.  The threshold is {@code max(floor, boundary)}
+     * documented range. The threshold is {@code max(floor, boundary)}
      * anyway, so the move is inert whenever the boundary already dominates
      * the floor.
      *
@@ -5304,7 +5528,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * The evidence gap required before a veto/undo fires: the fixed
      * {@link #MIN_TIDAL_EVIDENCE}, widened by twice the smoothed renewal
      * deviation (WindowClimber's {@code Rates.noiseBand} pricing) so noisy
-     * workloads are not hair-triggered by ordinary jitter.  Before the
+     * workloads are not hair-triggered by ordinary jitter. Before the
      * first sample the smoothed signal is unseeded and there is no
      * measured scatter, so the gap is 0 — a veto cannot fire against a
      * single sample (the bar is then the full base renewal).
@@ -5322,12 +5546,12 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * anchor-memory reference the verdict judges):
      * {@code clamp(round({@link #STEP_INITIAL} * (smoothed - bar) / noise), 1, {@link #STRIDE_MAX})}
      * with {@code bar = baseRenewal - margin} and {@code noise =
-     * max(MIN_TIDAL_EVIDENCE, margin)}.  At the arm the smoothed signal is
+     * max(MIN_TIDAL_EVIDENCE, margin)}. At the arm the smoothed signal is
      * the arm renewal, so the first stride is exactly the initial probe
      * step ({@link #STEP_INITIAL}); as the signal approaches the bar
      * the stride self-converges
      * to 1, and a below-bar signal (the crash zone) creeps while the
-     * verdict accumulates its persistence.  With no renewal history
+     * verdict accumulates its persistence. With no renewal history
      * (the unseeded state — a walk armed on the first tide, or
      * right after the regime reset) the noise floor cannot price the
      * stride, so the walk takes the default initial step.
@@ -5397,7 +5621,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * State — plain public fields (the retired bit-packed single-word layout
      * and its accessor boilerplate are gone): the retreat probe/persistence
-     * flags, distress, audit and flood state.  {@code retreatInFlight} keeps
+     * flags, distress, audit and flood state. {@code retreatInFlight} keeps
      * the legacy packed bit's exact meaning — true while a retreat is in
      * flight — so a parked governor reads it negated (the old accessor
      * contract: {@code retreating()} was true only while parked).
@@ -5415,10 +5639,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
       /**
        * (ADR-0059) descent slope probe: the descent's own reference — the
        * renewal where the descent started (the veto-arm sample, refreshed by
-       * the last probe sample when the probe deepens).  The descent direction
+       * the last probe sample when the probe deepens). The descent direction
        * (down toward the anchor) is falsified when the live renewal keeps
        * under-earning this reference minus the noise margin for
-       * {@link MoonsTidalForce#SLOPE_STREAK} tides.  Kept as a plain
+       * {@link MoonsTidalForce#SLOPE_STREAK} tides. Kept as a plain
        * {@code double}: a renewal ratio carries no fixed-point encoding
        * without precision loss.
        */
@@ -5426,7 +5650,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
       /**
        * Full wipe: the distress/audit streaks, the retreat machinery and the
-       * descent slope reference clear.  {@code floodLock} deliberately
+       * descent slope reference clear. {@code floodLock} deliberately
        * survives — a wipe that cleared it would re-arm into the same flood.
        */
       void reset() {
@@ -5443,7 +5667,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * Rates — the smoothed-renewal EMA pair (Caffeine's {@code Rates}): the
      * renewal mean and its mean absolute deviation, folded as one EMA pair by
-     * {@link MoonsTidalForce#foldRenewal(double)}.  Both fields reset
+     * {@link MoonsTidalForce#foldRenewal(double)}. Both fields reset
      * together so the pair's seeding stays consistent (R3's reset-then-update
      * ordering).
      */
@@ -5451,7 +5675,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
       /**
        * Smoothed renewal signal (Caffeine's {@code Rates.smoothed}): the EMA
-       * mean of the per-tide renewals, {@code NaN} = unseeded.  The release
+       * mean of the per-tide renewals, {@code NaN} = unseeded. The release
        * stride law prices its stride against this signal; the deviation EMA
        * ({@link #renewalDeviation}) is updated against the PRE-update
        * smoothed value, as an EMA pair (Caffeine's {@code Rates.update}).
@@ -5476,7 +5700,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
 
     /**
      * Regime — the P1 regime-switch debounce accumulators (wall-clock ms),
-     * saturating and deliverer-only.  (The volume EWMA itself stays a
+     * saturating and deliverer-only. (The volume EWMA itself stays a
      * governor field — {@code vol}.)
      */
     private static final class Regime {
@@ -5488,7 +5712,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * Ladder — one independent retry ledger per walk direction, selected by
      * the internal {@link Direction} enum (the retired half-segmented packed
-     * word is gone).  The pricing semantics are Caffeine's Ladder: a single
+     * word is gone). The pricing semantics are Caffeine's Ladder: a single
      * crash without escalation does not move the rung, a consecutive crash
      * run of {@link #PROBE_CRASH_ESCALATION} doubles it, a completed FAILED
      * experiment always doubles, a CONFIRMED walk rewards it back to rung 1,
@@ -5515,7 +5739,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       /**
        * Release-only deep-fail flag (R2's audit reschedule): set when a
        * completed FAILED release lands on the deepest rung — the escalation
-       * that stretches {@code auditWait()} past the backoff's reach.  Held
+       * that stretches {@code auditWait()} past the backoff's reach. Held
        * on the Ladder itself (not the per-direction ledgers) because only
        * the release direction can ever earn it.
        */
@@ -5592,7 +5816,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
       return positions.retreatTarget > positions.floor ? 1 : -1;
     }
 
-    /** Returns a convergent retreat stride (half the remaining distance plus one). */
+    /**
+     * Returns a convergent retreat stride (half the remaining distance plus one).
+     */
     private int decayStride(int stride) {
       return stride / 2 + 1;
     }
@@ -5602,7 +5828,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
       return (int) Math.max(boundary, PROMOTION_FLOOR);
     }
 
-    /** Returns true when blocked keys exist and the floor over-filters above the boundary. */
+    /**
+     * Returns true when blocked keys exist and the floor over-filters above the
+     * boundary.
+     */
     private boolean hasBlockedKeysAboveBoundary(int blockedKeys, long boundary) {
       return blockedKeys > 0 && positions.floor > effectiveBoundary(boundary);
     }
@@ -5644,11 +5873,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * the anchor reference by more than the noise margin.
      */
     private boolean shouldRetreatToAnchor(double renewal) {
-      return (
-        state.distressTides > VETO_STREAK &&
-        positions.floor > positions.anchorD + ANCHOR_BAND &&
-        renewal < (positions.anchorD_Renewal - vetoMargin())
-      );
+      return (state.distressTides > VETO_STREAK &&
+          positions.floor > positions.anchorD + ANCHOR_BAND &&
+          renewal < (positions.anchorD_Renewal - vetoMargin()));
     }
 
     /**
@@ -5660,20 +5887,18 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * the raise anyway).
      */
     private boolean shouldArmRaiseWalk(double hotColdRatio, int blockedKeys, boolean floodSig) {
-      return (
-        hotColdRatio < 1.0 &&
-        blockedKeys > 0 &&
-        positions.floor < FLOOR_MAX &&
-        !ladder.isBackingOff(RAISE) &&
-        state.distressTides >= RAISE_ARM_DELAY &&
-        // (flood suppression, ADR-0045 §III): under the flood signature or the
-        // flood lock the floor would be FLOOD-collapsed on this or the
-        // next tide — a raise is the wrong response to a stale floor
-        // blocking the whole distribution (and the empty-set collapse
-        // would undo it anyway).  floodSig is precomputed once in onTide.
-        !state.floodLock &&
-        !floodSig
-      );
+      return (hotColdRatio < 1.0 &&
+          blockedKeys > 0 &&
+          positions.floor < FLOOR_MAX &&
+          !ladder.isBackingOff(RAISE) &&
+          state.distressTides >= RAISE_ARM_DELAY &&
+          // (flood suppression, ADR-0045 §III): under the flood signature or the
+          // flood lock the floor would be FLOOD-collapsed on this or the
+          // next tide — a raise is the wrong response to a stale floor
+          // blocking the whole distribution (and the empty-set collapse
+          // would undo it anyway). floodSig is precomputed once in onTide.
+          !state.floodLock &&
+          !floodSig);
     }
 
     /**
@@ -5682,17 +5907,28 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * so the decision and the mutation stay separate.
      */
     private enum WalkEnding {
-      /** Below-target persistence: undo to the frozen base, deepening the layer's ladder. */
+      /**
+       * Below-target persistence: undo to the frozen base, deepening the layer's
+       * ladder.
+       */
       CRASHED,
-      /** Budget spent without a verdict: undo, priced as a completed, failed experiment. */
+      /**
+       * Budget spent without a verdict: undo, priced as a completed, failed
+       * experiment.
+       */
       FAILED,
-      /** The walk validated its position: keep it, plant the anchor, reward the ladder. */
+      /**
+       * The walk validated its position: keep it, plant the anchor, reward the
+       * ladder.
+       */
       CONFIRMED,
       /** No ending fired: take the next bold-driver stride. */
       WALKING,
     }
 
-    /** Computes how a raise walk ends this tide (Caffeine's {@code probeEnding}). */
+    /**
+     * Computes how a raise walk ends this tide (Caffeine's {@code probeEnding}).
+     */
     @SuppressWarnings("java:S3358")
     private WalkEnding raiseEnding(double renewal) {
       walk.samples++;
@@ -5702,13 +5938,13 @@ public class WaveCounter implements InitializingBean, Destroyable {
           return WalkEnding.CONFIRMED;
         }
         // (hard budget, ADR-0051): the budget check must hold on BOTH
-        // branches.  The legacy check lived only on the below-target
+        // branches. The legacy check lived only on the below-target
         // branch, so an alternating walk (at/below cycles that never reach
         // 3 consecutive of either) outlived the documented
         // TIDAL_WALK_BUDGET by up to ~1.5x — holding the floor hostage and
         // ratcheting in alternating regimes (surfaced by the sandbox
         // state-machine fuzzer: samples reached 17-18 with the budget at
-        // 16).  A hard budget converts those walks into priced FAILED
+        // 16). A hard budget converts those walks into priced FAILED
         // verdicts; paired campaigns show it net-neutral on the fuzz
         // corpora (6/250 excess wins, 3/250 confirm losses at 250 seeds)
         // while restoring the documented bound.
@@ -5717,14 +5953,16 @@ public class WaveCounter implements InitializingBean, Destroyable {
         walk.healthyStreak = 0;
 
         return (++walk.crashStreak >= TIDAL_CRASH_PERSISTENCE)
-          ? WalkEnding.CRASHED
-          : (walk.samples >= TIDAL_WALK_BUDGET)
-            ? WalkEnding.FAILED
-            : WalkEnding.WALKING;
+            ? WalkEnding.CRASHED
+            : (walk.samples >= TIDAL_WALK_BUDGET)
+                ? WalkEnding.FAILED
+                : WalkEnding.WALKING;
       }
     }
 
-    /** Computes how a release walk ends this tide (Caffeine's {@code probeEnding}). */
+    /**
+     * Computes how a release walk ends this tide (Caffeine's {@code probeEnding}).
+     */
     private WalkEnding releaseEnding(double renewal) {
       double bar = releaseBar(vetoMargin());
       walk.crashStreak = (renewal < bar) ? walk.crashStreak + 1 : 0;
@@ -5735,9 +5973,9 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // (beatBase, R5; Caffeine's audit confirm): the confirm requires
       // the goal metric to have matched or beaten the walk's start at
       // least once — a budget spent entirely below the arming level is a
-      // confirm against a colder reference (a false confirm).  The test
+      // confirm against a colder reference (a false confirm). The test
       // is inclusive (a saturating arming sample makes any
-      // strictly-greater bar unsatisfiable).  An unconfirmed budget is
+      // strictly-greater bar unsatisfiable). An unconfirmed budget is
       // priced as a completed FAILED experiment (undo + ladder
       // escalation), exactly like the raise direction.
       walk.beatBase |= renewal >= walk.baseRenewal;
@@ -5747,13 +5985,16 @@ public class WaveCounter implements InitializingBean, Destroyable {
       return WalkEnding.WALKING;
     }
 
-    /** Undoes a walk to its frozen base: budgeted return + the layer's ladder pricing. */
+    /**
+     * Undoes a walk to its frozen base: budgeted return + the layer's ladder
+     * pricing.
+     */
     private boolean undoWalk(Ladder.Direction direction, WalkEnding ending) {
       // An unconfirmed walk yields NO new anchor evidence: do NOT touch
-      // anchorD/anchorD_Renewal/anchorS here (unlike the confirm paths).  The
+      // anchorD/anchorD_Renewal/anchorS here (unlike the confirm paths). The
       // anchor is only re-learned on a confirm or a parked standDown; a
       // mid-walk workload shift is deferred to that parked re-learn by the
-      // narrow R3 gate (see the invariant comment at foldRenewal).  Ending the
+      // narrow R3 gate (see the invariant comment at foldRenewal). Ending the
       // walk returns the floor to its frozen base via the budgeted descent.
       positions.retreatTarget = walk.baseFloor;
       state.retreatStepsLeft = RETURN_BUDGET;
@@ -5769,7 +6010,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
         // deepest rung doubles the audit wait (WindowClimber's reschedule
         // law — the backoff's own wait covers rungs below the maximum, so
         // this is the only place the re-test cadence can stretch past it).
-        // A crash is priced as a workload shift and keeps the cadence.  The
+        // A crash is priced as a workload shift and keeps the cadence. The
         // flag is RELEASE-only — the raise direction never reads it, so the
         // dead raise-side write is gone.
         if (direction == RELEASE && ladder.release.rung >= TIDAL_BACKOFF_MAX) {
@@ -5809,7 +6050,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // refractory after a confirm (the alternating-workload
       // ratchet: arm -> 3 at-target -> confirm -> immediate re-arm
       // climbs the floor step by step until the empty-set
-      // collapse undoes the probe).  The rung is not touched —
+      // collapse undoes the probe). The rung is not touched —
       // only the wait — and the release ladder is separate.
       ladder.raise.left = CONFIRM_SHIELD;
       state.auditTides = 0;
@@ -5826,7 +6067,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * Advance a raise walk in the WALKING state: the walk steps only while
      * the set is still distressed and the evidence gates are satisfied
-     * (ADR-0045 §II + ADR-0053).  When the gates pass, a density-priced
+     * (ADR-0045 §II + ADR-0053). When the gates pass, a density-priced
      * stride raises the floor; otherwise the walk holds and the confirmation
      * or crash streak continues to accumulate.
      *
@@ -5839,11 +6080,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // (evidence-gated step, ADR-0045 §II): the step additionally
       // requires SOME member to still earn the threshold
       // (0 < renewal < target) AND the hot slots to still under-earn
-      // the cold reservoir (hotColdRatio < 1).  A renewal of 0 means
+      // the cold reservoir (hotColdRatio < 1). A renewal of 0 means
       // the set is quiet or dead — climbing cannot help it; a ratio
       // >= 1 means the members are genuinely earning — a step would
       // push the threshold past the marginal earners and eat the
-      // walk's own confirmation (the self-eating step).  The un-gated
+      // walk's own confirmation (the self-eating step). The un-gated
       // step outran the earners on oscillating workloads and
       // self-inflicted the empty-set collapse; with the gates the
       // walk ends in a priced FAILED/CRASHED verdict instead of a
@@ -5879,11 +6120,11 @@ public class WaveCounter implements InitializingBean, Destroyable {
       // by the smoothed renewal (the Rates EMA pair — ADR-0052 R1
       // replaced the 8-sample ring) against the walk's own crash bar
       // (baseRenewal - margin, the same reference the verdict
-      // judges).  Comfortably above the bar the walk strides boldly
+      // judges). Comfortably above the bar the walk strides boldly
       // (up to the ceiling); approaching the bar the stride shrinks
       // toward 1 so the verdict samples the decision zone at fine
       // granularity; below it the walk creeps while the crash
-      // persistence accumulates.  The law self-converges (gain -> 0
+      // persistence accumulates. The law self-converges (gain -> 0
       // as the signal -> the bar); the bold-driver decay it
       // replaces is retired for this direction, and the raise
       // direction prices its stride independently (ADR-0053), so
@@ -5899,7 +6140,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
      * {@code AuditClock.reschedule}): the standard {@link #AUDIT_WAIT}
      * healthy tides, stretched to {@link #AUDIT_WAIT_MAX} after a
      * completed FAILED release at the deepest ladder rung
-     * ({@code ladder.deepFail}).  The rung's own backoff already
+     * ({@code ladder.deepFail}). The rung's own backoff already
      * throttles intermediate rungs (the audit run accumulates during the
      * backoff, so the inter-attempt gap is max(backoff, wait) — the wait
      * law binds exactly where the backoff cannot).
@@ -5911,7 +6152,7 @@ public class WaveCounter implements InitializingBean, Destroyable {
     /**
      * A walk in flight (Caffeine's WindowClimber {@code Walk}): the floor
      * is moved one step per tide while the goal metric stays on the
-     * experiment's side.  The base (position AND renewal) is frozen at the
+     * experiment's side. The base (position AND renewal) is frozen at the
      * arm and is what the ending judges against: a persistent below-target
      * tide undoes the walk (budgeted return to {@link #baseFloor}), a
      * verdict of {@link #TIDAL_CRASH_PERSISTENCE} at-target tides
@@ -5942,9 +6183,10 @@ public class WaveCounter implements InitializingBean, Destroyable {
    * isolating the hot field from the object header and other instance
    * fields on both sides.
    *
-   * <p>Backed by a {@link LongAdder} (not an {@code AtomicInteger}): every
+   * <p>
+   * Backed by a {@link LongAdder} (not an {@code AtomicInteger}): every
    * writer's {@code drainInto} bump lands in its own striping cell, so batch
-   * merges from many writers never contend on a single cache line.  The
+   * merges from many writers never contend on a single cache line. The
    * deliverer's {@code get()} reads a stable {@code sum()} — exact here
    * because the adder is never reset (cells are never migrated), and the
    * settle-wait only needs "reached zero" semantics.

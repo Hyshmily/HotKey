@@ -28,6 +28,7 @@ import java.util.concurrent.Delayed;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -139,6 +140,65 @@ class WaveCounterSchedulingTest {
     counter.destroy();
     counter.nudgeTide();
     assertThat(scheduler.delaysMillis).containsExactly(500L);
+  }
+
+  /**
+   * Tide-failure log rate limit: a persistently throwing consumer fires a
+   * tide every ~50ms, so an unthrottled full-stack ERROR per tide would
+   * flood the log unboundedly. The FIRST failure opens the 10s window
+   * (ERROR with stack), failures inside the window are suppressed (DEBUG),
+   * and the window-opening repeat reports the suppressed count. Asserted
+   * log-free via the rate-limit state; the +1 schedule per tide proves the
+   * self-reschedule in the finally keeps the delivery chain alive through
+   * every failure.
+   */
+  @Test
+  void tideFailure_errorLogIsRateLimited_andChainReArms() throws Exception {
+    WaveCounter failing = new WaveCounter(
+      ignored -> {
+        throw new IllegalStateException("boom");
+      },
+      scheduler
+    );
+    failing.afterPropertiesSet();
+    // The finally re-arm in tide() is guarded by deliveryStarted so
+    // reflection-driven tides in tests never arm a background chain — arm it
+    // explicitly so the +1-schedule-per-tide assertion below is meaningful.
+    Field deliveryStartedField = WaveCounter.class.getDeclaredField("deliveryStarted");
+    deliveryStartedField.setAccessible(true);
+    deliveryStartedField.setBoolean(failing, true);
+    int schedulesBefore = scheduler.delaysMillis.size();
+
+    // Plant an expired window so the FIRST failure surely opens it:
+    // TimeSource.monotonicMillis() can be < 10s on a fresh JVM, which
+    // would make the zero-initialized timestamp read as "inside the
+    // window" and shift the expected suppression count.
+    Field openedAt = WaveCounter.class.getDeclaredField("lastTideErrorLoggedAtMs");
+    openedAt.setAccessible(true);
+    long before = TimeSource.monotonicMillis();
+    openedAt.setLong(failing, before - 60_000L);
+
+    Method tide = WaveCounter.class.getDeclaredMethod("tide");
+    tide.setAccessible(true);
+    // In production the pending one-shot future has FIRED by the time tide()'s
+    // finally re-arms (isDone → the coalescing pacer falls through and schedules
+    // the next tick). The recording scheduler never fires futures, so drop the
+    // pending reference BEFORE each tide to mimic that fired state — otherwise
+    // the equal-cadence re-arm request is absorbed by the still-pending fire.
+    Field pendingTideField = WaveCounter.class.getDeclaredField("pendingTide");
+    pendingTideField.setAccessible(true);
+    for (int i = 0; i < 3; i++) {
+      pendingTideField.set(failing, null);
+      failing.count("hot-key", 1); // non-empty snapshot → the consumer throws
+      tide.invoke(failing); // 1st: window-opening ERROR (stack) — 2nd/3rd: suppressed
+    }
+
+    Field suppressedField = WaveCounter.class.getDeclaredField("tideErrorsSuppressed");
+    suppressedField.setAccessible(true);
+    AtomicLong suppressed = (AtomicLong) suppressedField.get(failing);
+    assertThat(suppressed.get()).as("failures suppressed inside the window").isEqualTo(2);
+    assertThat(openedAt.getLong(failing)).as("window timestamp refreshed by the opening failure").isGreaterThanOrEqualTo(before);
+    assertThat(scheduler.delaysMillis).as("delivery chain re-armed once per failing tide").hasSize(schedulesBefore + 3);
   }
 
   /** Records every one-shot schedule request without executing it. */
