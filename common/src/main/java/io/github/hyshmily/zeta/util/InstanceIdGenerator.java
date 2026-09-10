@@ -77,13 +77,19 @@ public final class InstanceIdGenerator {
 
   /**
    * Set an explicit instance ID that takes precedence over all auto-detection.
-   * Typically called in a {@code @PostConstruct} from the first {@code @AutoConfiguration}.
+   * A {@code null} or blank {@code id} clears the override. Typically called in
+   * a {@code @PostConstruct} from the first {@code @AutoConfiguration}.
    */
   public static void setOverride(String id) {
-    if (!Objects.equals(id, override)) {
-      LOG.log(INFO, "Instance ID override set: {0}", id);
+    String normalized = (id != null && !id.isBlank()) ? id : null;
+    if (!Objects.equals(normalized, override)) {
+      if (normalized != null) {
+        LOG.log(INFO, "Instance ID override set: {0}", normalized);
+      } else {
+        LOG.log(INFO, "Instance ID override cleared");
+      }
     }
-    override = id;
+    override = normalized;
     cached = null;
   }
 
@@ -96,8 +102,11 @@ public final class InstanceIdGenerator {
   public static String get() {
     // Check override on every call so that setOverride() takes effect even if
     // get() was already invoked earlier (e.g. WorkerAutoConfiguration field init).
-    if (override != null && !override.isBlank()) {
-      return override;
+    // Read into a local first: returning the field directly could observe a
+    // concurrent setOverride(null) between the check and the return.
+    String overrideId = override;
+    if (overrideId != null) {
+      return overrideId;
     }
     if (cached == null) {
       synchronized (InstanceIdGenerator.class) {
